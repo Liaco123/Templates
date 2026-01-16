@@ -1,0 +1,24 @@
+@PACKAGE_INIT@
+
+# ==============================================================================
+# Dependency Management (Transitive Dependencies)
+# ==============================================================================
+# 如果你的库头文件里 include 了 fmt/core.h (PUBLIC 依赖)，
+# 必须在这里通过 find_dependency 把 fmt 找回来，否则下游用户编译会报错。
+
+include(CMakeFindDependencyMacro)
+
+# [Example] Uncomment if your library publicly depends on 'fmt'
+# find_dependency(fmt REQUIRED)
+
+# ==============================================================================
+# Include Targets
+# ==============================================================================
+# 加载你刚才在 CMakeLists.txt 里通过 install(EXPORT) 导出的目标信息
+include("${CMAKE_CURRENT_LIST_DIR}/{{name}}Targets.cmake")
+
+# 检查组件完整性
+check_required_components("{{name}}")
+
+# (Optional) Print a polite message
+# message(STATUS "Found {{name}}: ${CMAKE_CURRENT_LIST_DIR}")
