@@ -45,7 +45,7 @@ class MyProject(ConanFile):
                 folder_name = "clang_std"  # 对应 clang+libstdc++
 
         self.folders.generators = os.path.join(
-            "deps", folder_name, str(self.settings.build_type)
+            ".deps", folder_name, str(self.settings.build_type)
         )
 
     def requirements(self):

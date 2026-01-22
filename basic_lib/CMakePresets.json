@@ -23,7 +23,7 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/deps/clang_msvc/Release/conan_toolchain.cmake"
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/.deps/clang_msvc/Release/conan_toolchain.cmake"
       }
     },
     {
@@ -33,7 +33,7 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/deps/clang_msvc/Debug/conan_toolchain.cmake"
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/.deps/clang_msvc/Debug/conan_toolchain.cmake"
       }
     },
     // --- 2. MSVC Native ---
@@ -43,7 +43,7 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/deps/msvc/Release/conan_toolchain.cmake"
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/.deps/msvc/Release/conan_toolchain.cmake"
       }
     },
     {
@@ -52,7 +52,7 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/deps/msvc/Debug/conan_toolchain.cmake"
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/.deps/msvc/Debug/conan_toolchain.cmake"
       }
     },
     // --- 3. Clang + libc++ (Strict) ---
@@ -62,7 +62,7 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/deps/clang/Release/conan_toolchain.cmake"
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/.deps/clang/Release/conan_toolchain.cmake"
       }
     },
     {
@@ -72,7 +72,7 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/deps/clang/Debug/conan_toolchain.cmake"
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/.deps/clang/Debug/conan_toolchain.cmake"
       }
     },
     // --- 4. Clang + libstdc++ ---
@@ -82,7 +82,7 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/deps/clang_std/Release/conan_toolchain.cmake"
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/.deps/clang_std/Release/conan_toolchain.cmake"
       }
     },
     {
@@ -91,7 +91,7 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/deps/clang_std/Debug/conan_toolchain.cmake"
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/.deps/clang_std/Debug/conan_toolchain.cmake"
       }
     },
     // --- 5. GCC ---
@@ -101,7 +101,7 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/deps/gcc/Release/conan_toolchain.cmake"
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/.deps/gcc/Release/conan_toolchain.cmake"
       }
     },
     {
@@ -110,7 +110,7 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/deps/gcc/Debug/conan_toolchain.cmake"
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/.deps/gcc/Debug/conan_toolchain.cmake"
       }
     }
   ],
