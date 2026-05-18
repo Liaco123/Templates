@@ -1,14 +1,24 @@
 import os
+import argparse
 import platform
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 
-def setup_templates():
-    # 1. 获取源目录（当前脚本所在目录）和目标目录
-    source_root = Path(__file__).parent.absolute()
-    dest_root = Path("~/.conan2/templates/command/new").expanduser().absolute()
+TEMPLATE_NAMES = {"basic_exe", "basic_lib", "header_lib"}
+
+
+def iter_template_dirs(source_root):
+    for item in sorted(source_root.iterdir(), key=lambda path: path.name):
+        if item.name in TEMPLATE_NAMES and item.is_dir():
+            yield item
+
+
+def setup_templates(source_root=None, dest_root=None, link=False):
+    source_root = Path(source_root or Path(__file__).parent).resolve()
+    dest_root = Path(dest_root or "~/.conan2/templates/command/new").expanduser().resolve()
 
     current_os = platform.system().lower()
     is_windows = current_os == "windows"
@@ -26,32 +36,25 @@ def setup_templates():
             print(f"[!] 无法创建目标目录：{e}")
             sys.exit(1)
 
-    # 3. 遍历当前目录下的文件夹
     count = 0
-    for item in source_root.iterdir():
-        # 过滤掉不需要的项目：
-        # 1. 不是文件夹
-        # 2. 隐藏文件夹 (.git, .vscode 等)
-        # 3. Python 缓存 (__pycache__)
-        if not item.is_dir() or item.name.startswith(".") or item.name == "__pycache__":
-            continue
-
+    for item in iter_template_dirs(source_root):
         target_path = dest_root / item.name
 
-        # 检查目标是否已存在
         if target_path.exists() or target_path.is_symlink():
             print(f"[-] 跳过：{item.name} (目标已存在)")
             continue
 
         try:
-            if is_windows:
-                # --- Windows 策略：使用 mklink /J (Junction) ---
-                # mklink 是 cmd 的内部命令，必须用 shell=True
-                # /J 只能用于目录，且不需要管理员权限
-                # 注意引号，防止路径中有空格
+            if not link:
+                shutil.copytree(
+                    item,
+                    target_path,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+                )
+                print(f"[+] 模板复制成功：{item.name}")
+                count += 1
+            elif is_windows:
                 cmd = f'mklink /J "{target_path}" "{item}"'
-
-                # subprocess.run 会阻塞直到命令完成
                 result = subprocess.run(
                     cmd,
                     shell=True,
@@ -61,26 +64,48 @@ def setup_templates():
                 )
 
                 if result.returncode == 0:
-                    print(f"[+] Win Junction 创建成功：{item.name}")
+                    print(f"[+] Windows Junction 创建成功：{item.name}")
                     count += 1
                 else:
                     print(
-                        f"[!] Win Junction 创建失败 {item.name}: {result.stderr.strip()}"
+                        f"[!] Windows Junction 创建失败 {item.name}: {result.stderr.strip()}"
                     )
 
             else:
-                # --- Linux 策略：使用 os.symlink (等同于 ln -s) ---
-                # os.symlink(src, dst)
                 os.symlink(item, target_path)
-                print(f"[+] Linux Symlink 创建成功：{item.name}")
+                print(f"[+] Symlink 创建成功：{item.name}")
                 count += 1
 
         except Exception as e:
             print(f"[!] 发生错误 {item.name}: {e}")
 
-    print(f"\n[*] 全部完成，共链接了 {count} 个模板目录。")
+    action = "链接" if link else "复制"
+    print(f"\n[*] 全部完成，共{action}了 {count} 个模板目录。")
     print("[*] 你可以使用 'conan new <folder_name>' 进行验证。")
 
 
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Install local Conan new templates.")
+    parser.add_argument(
+        "--source-root",
+        type=Path,
+        default=Path(__file__).parent,
+        help="模板源目录，默认是当前脚本所在目录。",
+    )
+    parser.add_argument(
+        "--dest-root",
+        type=Path,
+        default=Path("~/.conan2/templates/command/new").expanduser(),
+        help="Conan new 模板目标目录。",
+    )
+    parser.add_argument(
+        "--link",
+        action="store_true",
+        help="使用 symlink/Junction 注册模板；默认复制模板并忽略 Python 缓存文件。",
+    )
+    args = parser.parse_args(argv)
+    setup_templates(args.source_root, args.dest_root, link=args.link)
+
+
 if __name__ == "__main__":
-    setup_templates()
+    main()

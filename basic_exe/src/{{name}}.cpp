@@ -1,5 +1,5 @@
 #include "{{name}}.hpp"
 
-#include <iostream>
-
-int main() { return 0; }
+int main() {
+    return app_answer() == 42 ? 0 : 1;
+}
