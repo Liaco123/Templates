@@ -16,6 +16,73 @@ def iter_template_dirs(source_root):
             yield item
 
 
+def install_clangd_format_scripts(source_root):
+    local_bin = Path("~/.local/bin").expanduser().resolve()
+    local_bin.mkdir(parents=True, exist_ok=True)
+    clang_format_path = source_root / ".clang-format"
+    
+    if not clang_format_path.exists():
+        print(f"[!] 未找到根目录 .clang-format，跳过脚本生成。")
+        return
+
+    script_names = ["clangd_format", "clangd_foramt"]
+    current_os = platform.system().lower()
+    is_windows = current_os == "windows"
+
+    for name in script_names:
+        # Bash version
+        bash_script = local_bin / name
+        bash_content = (
+            f'#!/bin/sh\n'
+            f'cp -f "{clang_format_path.as_posix()}" .\n'
+            f'if [ $? -eq 0 ]; then\n'
+            f'    echo "[完成] 已成功复制 .clang-format 到当前目录。"\n'
+            f'else\n'
+            f'    echo "[错误] 复制 .clang-format 失败。"\n'
+            f'fi\n'
+        )
+        try:
+            bash_script.write_text(bash_content, encoding="utf-8")
+            if not is_windows:
+                bash_script.chmod(0o755)
+            print(f"[+] 已写入 Bash 脚本：{bash_script}")
+        except Exception as e:
+            print(f"[!] 写入 Bash 脚本 {bash_script} 失败: {e}")
+
+        # Batch version
+        bat_script = local_bin / f"{name}.bat"
+        bat_content = (
+            f'@echo off\n'
+            f'copy /Y "{clang_format_path}" . >nul\n'
+            f'if %errorlevel% equ 0 (\n'
+            f'    echo [完成] 已成功复制 .clang-format 到当前目录。\n'
+            f') else (\n'
+            f'    echo [错误] 复制 .clang-format 失败。\n'
+            f')\n'
+        )
+        try:
+            bat_script.write_text(bat_content, encoding="utf-8")
+            print(f"[+] 已写入 CMD 脚本：{bat_script}")
+        except Exception as e:
+            print(f"[!] 写入 CMD 脚本 {bat_script} 失败: {e}")
+
+        # PowerShell version
+        ps1_script = local_bin / f"{name}.ps1"
+        ps1_content = (
+            f'Copy-Item -Path "{clang_format_path}" -Destination . -Force\n'
+            f'if ($?) {{\n'
+            f'    Write-Host "[完成] 已成功复制 .clang-format 到当前目录。" -ForegroundColor Green\n'
+            f'}} else {{\n'
+            f'    Write-Host "[错误] 复制 .clang-format 失败。" -ForegroundColor Red\n'
+            f'}}\n'
+        )
+        try:
+            ps1_script.write_text(ps1_content, encoding="utf-8")
+            print(f"[+] 已写入 PowerShell 脚本：{ps1_script}")
+        except Exception as e:
+            print(f"[!] 写入 PowerShell 脚本 {ps1_script} 失败: {e}")
+
+
 def setup_templates(source_root=None, dest_root=None, link=False):
     source_root = Path(source_root or Path(__file__).parent).resolve()
     dest_root = Path(dest_root or "~/.conan2/templates/command/new").expanduser().resolve()
@@ -26,6 +93,23 @@ def setup_templates(source_root=None, dest_root=None, link=False):
     print(f"[*] 检测到操作系统：{platform.system()}")
     print(f"[*] 源目录：{source_root}")
     print(f"[*] 目标目录：{dest_root}")
+
+    # 1. 同步根目录下的 .clang-format 到各个模板目录和已部署目录
+    root_clang_format = source_root / ".clang-format"
+    if root_clang_format.exists():
+        for item_name in TEMPLATE_NAMES:
+            template_dir = source_root / item_name
+            if template_dir.exists() and template_dir.is_dir():
+                shutil.copy2(root_clang_format, template_dir / ".clang-format")
+                print(f"[+] 同步 .clang-format 到源模板目录：{item_name}")
+
+            target_template_dir = dest_root / item_name
+            if target_template_dir.exists() and target_template_dir.is_dir():
+                try:
+                    shutil.copy2(root_clang_format, target_template_dir / ".clang-format")
+                    print(f"[+] 同步 .clang-format 到已部署模板目录：{item_name}")
+                except Exception as e:
+                    print(f"[!] 无法同步 .clang-format 到已部署模板目录 {target_template_dir}: {e}")
 
     # 2. 如果目标根目录不存在，自动创建
     if not dest_root.exists():
@@ -81,6 +165,10 @@ def setup_templates(source_root=None, dest_root=None, link=False):
 
     action = "链接" if link else "复制"
     print(f"\n[*] 全部完成，共{action}了 {count} 个模板目录。")
+    
+    # 3. 自动生成并安装 clangd_format 脚本到 ~/.local/bin
+    install_clangd_format_scripts(source_root)
+    
     print("[*] 你可以使用 'conan new <folder_name>' 进行验证。")
 
 
