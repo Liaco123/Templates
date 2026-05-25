@@ -1,7 +1,7 @@
 ---
 Language: Cpp
 BasedOnStyle: WebKit
-Standard: c++23
+Standard: c++20
 
 ColumnLimit: 100
 IndentWidth: 4
