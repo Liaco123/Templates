@@ -21,6 +21,8 @@ DEV_ROOT = Path("C:/dev") if platform.system().lower() == "windows" else HOME / 
 GCC_DIR = DEV_ROOT / "gcc"
 CLANG_DIR = DEV_ROOT / "llvm-mingw"
 CLANG_MSVC_DIR = DEV_ROOT / "clang_msvc"
+CONAN_CPPSTD = "23"
+CONAN_CMAKE_GENERATOR = "Ninja"
 
 
 @dataclass(frozen=True)
@@ -668,7 +670,15 @@ def write_profile(name: str, settings: dict[str, str], compiler_executables: dic
     for key in ("os", "arch", "compiler", "compiler.version", "compiler.cppstd", "compiler.runtime", "compiler.runtime_type", "compiler.libcxx", "build_type"):
         if key in settings:
             lines.append(f"{key}={settings[key]}")
-    lines.extend(["", "[conf]", f"tools.build:compiler_executables={json.dumps(compiler_executables)}", ""])
+    lines.extend(
+        [
+            "",
+            "[conf]",
+            f"tools.build:compiler_executables={json.dumps(compiler_executables)}",
+            f"tools.cmake.cmaketoolchain:generator={CONAN_CMAKE_GENERATOR}",
+            "",
+        ]
+    )
     profile.write_text("\n".join(lines), encoding="utf-8")
     ok(f"已生成 Conan profile：{profile}")
 
@@ -689,7 +699,7 @@ def generate_compiler_profiles() -> bool:
                 "arch": arch,
                 "compiler": "gcc",
                 "compiler.version": compiler_major_version(gxx, "13"),
-                "compiler.cppstd": "20",
+                "compiler.cppstd": CONAN_CPPSTD,
                 "compiler.libcxx": "libstdc++11",
                 "build_type": default_settings.get("build_type", "Release"),
             },
@@ -709,7 +719,7 @@ def generate_compiler_profiles() -> bool:
                 "arch": arch,
                 "compiler": "clang",
                 "compiler.version": compiler_major_version(clangxx, "17"),
-                "compiler.cppstd": "20",
+                "compiler.cppstd": CONAN_CPPSTD,
                 "compiler.libcxx": "libc++" if system == "Darwin" else "libstdc++11",
                 "build_type": default_settings.get("build_type", "Release"),
             },
@@ -724,7 +734,7 @@ def generate_compiler_profiles() -> bool:
         if clang_cl and default_settings.get("compiler") == "msvc":
             settings = dict(default_settings)
             settings["compiler"] = "msvc"
-            settings.setdefault("compiler.cppstd", "20")
+            settings["compiler.cppstd"] = CONAN_CPPSTD
             write_profile("clang_msvc", settings, {"c": clang_cl, "cpp": clang_cl})
             generated = True
         elif clang_cl:
