@@ -23,6 +23,12 @@ CLANG_DIR = DEV_ROOT / "llvm-mingw"
 CLANG_MSVC_DIR = DEV_ROOT / "clang_msvc"
 CONAN_CPPSTD = "23"
 CONAN_CMAKE_GENERATOR = "Ninja"
+DEFAULT_MSVC_VERSION = "193"
+MANAGED_PROFILE_NAMES = {"gcc", "clang", "msvc", "clang_msvc"}
+
+
+LAST_AVAILABLE_PRESET_GROUPS: set[str] = set()
+LAST_PRESET_ENVIRONMENTS: dict[str, dict[str, str]] = {}
 
 
 @dataclass(frozen=True)
@@ -366,6 +372,189 @@ def find_clang_cl() -> str | None:
     return str(candidates[0]) if candidates else None
 
 
+def visual_studio_installation_paths() -> list[Path]:
+    if not is_windows():
+        return []
+
+    paths: list[Path] = []
+    program_files_x86 = Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)"))
+    vswhere = program_files_x86 / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if vswhere.exists():
+        try:
+            result = capture_command(
+                [
+                    str(vswhere),
+                    "-products",
+                    "*",
+                    "-requires",
+                    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                    "-property",
+                    "installationPath",
+                ]
+            )
+        except (OSError, subprocess.SubprocessError):
+            result = None
+        if result and result.returncode == 0:
+            paths.extend(Path(line.strip()) for line in result.stdout.splitlines() if line.strip())
+
+    for root in (
+        Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Microsoft Visual Studio",
+        program_files_x86 / "Microsoft Visual Studio",
+    ):
+        if not root.exists():
+            continue
+        try:
+            for vc_tools in root.glob("*/*/VC/Tools/MSVC"):
+                paths.append(vc_tools.parents[2])
+        except OSError:
+            continue
+
+    unique: list[Path] = []
+    for path in paths:
+        if path.exists() and not any(same_path(path, existing) for existing in unique):
+            unique.append(path)
+    return unique
+
+
+def msvc_target_arch(conan_arch: str) -> str:
+    normalized = conan_arch.lower()
+    if normalized in {"x86", "x86_32"}:
+        return "x86"
+    if normalized in {"armv8", "arm64", "aarch64"}:
+        return "arm64"
+    return "x64"
+
+
+def find_msvc_cl(arch: str = "x86_64") -> str | None:
+    exe_suffix = ".exe" if is_windows() else ""
+    path_cl = find_from_path(f"cl{exe_suffix}")
+    if path_cl:
+        return str(path_cl)
+
+    if not is_windows():
+        return None
+
+    host_arch = "Hostx64"
+    target_arch = msvc_target_arch(arch)
+    candidates: list[Path] = []
+    for install_path in visual_studio_installation_paths():
+        tools_root = install_path / "VC" / "Tools" / "MSVC"
+        if not tools_root.exists():
+            continue
+        try:
+            candidates.extend(tools_root.glob(f"*/bin/{host_arch}/{target_arch}/cl.exe"))
+        except OSError:
+            continue
+
+    candidates = sorted(candidates, key=lambda path: path.parts, reverse=True)
+    return str(candidates[0]) if candidates else None
+
+
+def version_key(path: Path) -> tuple[int, ...]:
+    parts: list[int] = []
+    for token in path.name.split("."):
+        if not token.isdigit():
+            return ()
+        parts.append(int(token))
+    return tuple(parts)
+
+
+def latest_existing_version_dir(root: Path, required_children: tuple[str, ...] = ()) -> Path | None:
+    if not root.exists():
+        return None
+
+    candidates: list[Path] = []
+    try:
+        for child in root.iterdir():
+            if not child.is_dir() or not version_key(child):
+                continue
+            if all((child / required_child).exists() for required_child in required_children):
+                candidates.append(child)
+    except OSError:
+        return None
+
+    return max(candidates, key=version_key) if candidates else None
+
+
+def windows_sdk_root() -> Path:
+    return Path(os.environ.get("WindowsSdkDir", r"C:\Program Files (x86)\Windows Kits\10"))
+
+
+def msvc_build_environment(arch: str = "x86_64") -> dict[str, str] | None:
+    if not is_windows():
+        return None
+
+    cl = find_msvc_cl(arch)
+    if not cl:
+        return None
+
+    cl_path = Path(cl)
+    target_arch = msvc_target_arch(arch)
+    tools_root = cl_path.parents[3]
+    install_path = tools_root.parents[3]
+    sdk_root = windows_sdk_root()
+    sdk_version_dir = latest_existing_version_dir(
+        sdk_root / "include",
+        ("ucrt", "um", "shared"),
+    )
+    if not sdk_version_dir:
+        return None
+
+    sdk_version = sdk_version_dir.name
+    sdk_bin_version = sdk_root / "bin" / sdk_version
+    sdk_bin_arch = sdk_bin_version / target_arch
+    sdk_bin_fallback = sdk_root / "bin" / target_arch
+
+    paths = [
+        cl_path.parent,
+        install_path / "Common7" / "IDE" / "VC" / "VCPackages",
+        sdk_bin_arch,
+        sdk_bin_fallback,
+        install_path / "Common7" / "IDE",
+        install_path / "Common7" / "Tools",
+    ]
+    include_paths = [
+        tools_root / "include",
+        install_path / "VC" / "Auxiliary" / "VS" / "include",
+        sdk_root / "include" / sdk_version / "ucrt",
+        sdk_root / "include" / sdk_version / "um",
+        sdk_root / "include" / sdk_version / "shared",
+        sdk_root / "include" / sdk_version / "winrt",
+        sdk_root / "include" / sdk_version / "cppwinrt",
+    ]
+    lib_paths = [
+        tools_root / "lib" / target_arch,
+        sdk_root / "lib" / sdk_version / "ucrt" / target_arch,
+        sdk_root / "lib" / sdk_version / "um" / target_arch,
+    ]
+    libpath_paths = [
+        tools_root / "lib" / target_arch,
+        Path(os.environ.get("FrameworkDir64", r"C:\Windows\Microsoft.NET\Framework64")) / os.environ.get("FrameworkVersion64", "v4.0.30319"),
+    ]
+
+    if not all(path.exists() for path in include_paths[:5]):
+        return None
+    if not all(path.exists() for path in lib_paths):
+        return None
+    if not (cl_path.parent / "link.exe").exists():
+        return None
+    if not any((path / "rc.exe").exists() for path in (sdk_bin_arch, sdk_bin_fallback)):
+        return None
+    if not any((path / "mt.exe").exists() for path in (sdk_bin_arch, sdk_bin_fallback)):
+        return None
+
+    return {
+        "PATH": ";".join(str(path) for path in paths if path.exists()) + ";$penv{PATH}",
+        "INCLUDE": ";".join(str(path) for path in include_paths if path.exists()),
+        "LIB": ";".join(str(path) for path in lib_paths if path.exists()),
+        "LIBPATH": ";".join(str(path) for path in libpath_paths if path.exists()),
+    }
+
+
+def has_msvc_build_environment(arch: str = "x86_64") -> bool:
+    return msvc_build_environment(arch) is not None
+
+
 def discovered_compilers() -> dict[str, str | tuple[str, str]]:
     compilers: dict[str, str | tuple[str, str]] = {}
     gcc = find_gcc_pair()
@@ -374,10 +563,47 @@ def discovered_compilers() -> dict[str, str | tuple[str, str]]:
     clang = find_clang_pair()
     if clang:
         compilers["clang"] = clang
+    msvc_env = has_msvc_build_environment()
     clang_cl = find_clang_cl()
-    if clang_cl:
+    if clang_cl and msvc_env:
         compilers["clang_msvc"] = clang_cl
+    msvc_cl = find_msvc_cl()
+    if msvc_cl and msvc_env:
+        compilers["msvc"] = msvc_cl
     return compilers
+
+
+def available_cmake_preset_groups(default_settings: dict[str, str] | None = None) -> set[str]:
+    settings = default_settings or read_default_profile_settings()
+    system = platform.system()
+    arch = settings.get("arch", "x86_64")
+    groups: set[str] = set()
+
+    if find_gcc_pair():
+        groups.add("gcc")
+
+    if find_clang_pair():
+        groups.add("clang-libcxx" if system == "Darwin" else "clang-std")
+
+    msvc_env = has_msvc_build_environment(arch)
+    if msvc_env:
+        groups.add("msvc")
+        if find_clang_cl():
+            groups.add("clang-msvc")
+
+    return groups
+
+
+def cmake_preset_environments(default_settings: dict[str, str] | None = None) -> dict[str, dict[str, str]]:
+    settings = default_settings or read_default_profile_settings()
+    arch = settings.get("arch", "x86_64")
+    msvc_env = msvc_build_environment(arch)
+    if not msvc_env:
+        return {}
+    environments = {"msvc": msvc_env}
+    if find_clang_cl():
+        environments["clang-msvc"] = msvc_env
+    return environments
 
 
 def command_version(command: str) -> str:
@@ -412,6 +638,37 @@ def compiler_major_version(executable: str, fallback: str) -> str:
         if token and token[0].isdigit() and "." in token:
             return token.split(".")[0]
     return fallback
+
+
+def msvc_compiler_version(executable: str, fallback: str = DEFAULT_MSVC_VERSION) -> str:
+    try:
+        result = capture_command([executable])
+    except (OSError, subprocess.SubprocessError):
+        return fallback
+
+    text = f"{result.stdout}\n{result.stderr}"
+    match = re.search(r"Version\s+19\.(\d+)", text)
+    if not match:
+        return fallback
+    return f"19{int(match.group(1)) // 10}"
+
+
+def msvc_profile_settings(default_settings: dict[str, str], msvc_cl: str, arch: str) -> dict[str, str]:
+    settings = dict(default_settings)
+    settings["os"] = settings.get("os", "Windows")
+    settings["arch"] = arch
+    settings["compiler"] = "msvc"
+    settings["compiler.version"] = (
+        default_settings.get("compiler.version")
+        if default_settings.get("compiler") == "msvc" and default_settings.get("compiler.version")
+        else msvc_compiler_version(msvc_cl)
+    )
+    settings["compiler.cppstd"] = CONAN_CPPSTD
+    settings["compiler.runtime"] = settings.get("compiler.runtime", "dynamic")
+    settings["compiler.runtime_type"] = settings.get("compiler.runtime_type", settings.get("build_type", "Release"))
+    settings["build_type"] = settings.get("build_type", "Release")
+    settings.pop("compiler.libcxx", None)
+    return settings
 
 
 def install_uv(check_only: bool) -> str | None:
@@ -618,15 +875,21 @@ def check_compiler() -> bool:
         ok(f"检测到 llvm-mingw Clang：{clang_pair[1]}")
         found = True
 
+    msvc_env = has_msvc_build_environment()
     clang_cl = find_clang_cl()
-    if clang_cl:
-        ok(f"检测到 clang-cl：{clang_cl}")
+    if clang_cl and msvc_env:
+        ok(f"检测到可用 clang-cl/MSVC 工具链：{clang_cl}")
         found = True
+    elif clang_cl:
+        warn(f"检测到 clang-cl，但当前终端没有完整 VS 构建环境：{clang_cl}")
 
-    cl = find_executable("cl")
-    if cl:
-        ok(f"检测到 MSVC cl：{cl}")
+    cl = find_msvc_cl()
+    if cl and msvc_env:
+        ok(f"检测到完整 MSVC 构建环境：{cl}")
         found = True
+    elif cl:
+        warn(f"检测到 MSVC cl，但当前终端没有完整 VS 构建环境：{cl}")
+        warn("请在 Developer Command Prompt / VsDevCmd.bat 初始化后的终端中运行 MSVC/clang-cl preset。")
 
     if found:
         return True
@@ -683,11 +946,25 @@ def write_profile(name: str, settings: dict[str, str], compiler_executables: dic
     ok(f"已生成 Conan profile：{profile}")
 
 
+def remove_stale_compiler_profiles(active_profile_names: set[str]) -> None:
+    stale_names = MANAGED_PROFILE_NAMES - active_profile_names
+    for name in sorted(stale_names):
+        profile = conan_profiles_dir() / name
+        if not profile.exists():
+            continue
+        try:
+            profile.unlink()
+            warn(f"已删除不可用工具链对应的 Conan profile：{profile}")
+        except OSError as exc:
+            warn(f"无法删除不可用工具链对应的 Conan profile {profile}：{exc}")
+
+
 def generate_compiler_profiles() -> bool:
     default_settings = read_default_profile_settings()
     system = platform.system()
     arch = default_settings.get("arch", "x86_64")
     generated = False
+    active_profile_names: set[str] = set()
 
     gcc_pair = find_gcc_pair()
     if gcc_pair:
@@ -706,6 +983,7 @@ def generate_compiler_profiles() -> bool:
             {"c": gcc, "cpp": gxx},
         )
         generated = True
+        active_profile_names.add("gcc")
     else:
         warn("未生成 gcc profile：没有找到 gcc/g++ 可执行文件。")
 
@@ -726,22 +1004,35 @@ def generate_compiler_profiles() -> bool:
             {"c": clang, "cpp": clangxx},
         )
         generated = True
+        active_profile_names.add("clang")
     else:
         warn("未生成 clang profile：没有找到 clang/clang++ 可执行文件。")
 
     if is_windows():
-        clang_cl = find_clang_cl()
-        if clang_cl and default_settings.get("compiler") == "msvc":
-            settings = dict(default_settings)
-            settings["compiler"] = "msvc"
-            settings["compiler.cppstd"] = CONAN_CPPSTD
-            write_profile("clang_msvc", settings, {"c": clang_cl, "cpp": clang_cl})
+        msvc_cl = find_msvc_cl(arch)
+        if msvc_cl and has_msvc_build_environment(arch):
+            msvc_settings = msvc_profile_settings(default_settings, msvc_cl, arch)
+            write_profile("msvc", msvc_settings, {"c": msvc_cl, "cpp": msvc_cl})
             generated = True
+            active_profile_names.add("msvc")
+        elif msvc_cl:
+            msvc_settings = None
+            warn("未生成 msvc profile：检测到 cl，但当前终端没有完整 VS 构建环境。")
+        else:
+            msvc_settings = None
+            warn("未生成 msvc profile：没有找到 MSVC cl。")
+
+        clang_cl = find_clang_cl()
+        if clang_cl and msvc_settings:
+            write_profile("clang_msvc", msvc_settings, {"c": clang_cl, "cpp": clang_cl})
+            generated = True
+            active_profile_names.add("clang_msvc")
         elif clang_cl:
-            warn("检测到 clang-cl，但 default profile 不是 MSVC，无法安全生成 clang_msvc profile。请先安装 MSVC Build Tools 并运行 conan profile detect --force。")
+            warn("检测到 clang-cl，但当前终端没有完整 VS 构建环境，未生成 clang_msvc profile。")
         else:
             warn("未生成 clang_msvc profile：没有找到 clang-cl。")
 
+    remove_stale_compiler_profiles(active_profile_names)
     return generated
 
 
@@ -799,6 +1090,8 @@ def ensure_tool(tool: Tool, uv: str | None, check_only: bool) -> bool:
 
 
 def setup_environment(check_only: bool = False) -> bool:
+    global LAST_AVAILABLE_PRESET_GROUPS, LAST_PRESET_ENVIRONMENTS
+
     log(f"当前系统：{platform.system()} {platform.release()} ({platform.machine()})")
     log(f"Python：{sys.version.split()[0]}，路径：{sys.executable}")
 
@@ -843,6 +1136,9 @@ def setup_environment(check_only: bool = False) -> bool:
 
     if not check_only and not generate_compiler_profiles():
         warn("没有生成任何编译器专用 Conan profile。")
+
+    LAST_AVAILABLE_PRESET_GROUPS = available_cmake_preset_groups()
+    LAST_PRESET_ENVIRONMENTS = cmake_preset_environments()
 
     if required_ok:
         ok("必需环境检查通过。")

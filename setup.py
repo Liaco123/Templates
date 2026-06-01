@@ -47,9 +47,14 @@ def run_setup(args) -> int:
         if args.check_only:
             print("[信息] 仅检查模式不会复制或链接模板。")
         else:
+            enabled_preset_groups = setup_dev.LAST_AVAILABLE_PRESET_GROUPS or setup_dev.available_cmake_preset_groups()
+            preset_environments = setup_dev.LAST_PRESET_ENVIRONMENTS or setup_dev.cmake_preset_environments()
+            print(f"[信息] 可用 CMake preset 组：{', '.join(sorted(enabled_preset_groups)) if enabled_preset_groups else '无'}")
             setup_templates.setup_templates(
                 dest_root=args.template_dest,
                 link=args.link_templates,
+                enabled_preset_groups=enabled_preset_groups,
+                preset_environments=preset_environments,
             )
 
     print("\n========================================")
@@ -66,7 +71,20 @@ def main(argv=None) -> int:
     parser.add_argument("--check-only", action="store_true", help="只检查环境，不安装工具，不注册模板。")
     parser.add_argument("--skip-env", action="store_true", help="跳过开发环境检查和安装。")
     parser.add_argument("--skip-templates", action="store_true", help="跳过 Conan 模板注册。")
-    parser.add_argument("--link-templates", action="store_true", help="用 symlink/Junction 注册模板；默认复制模板。")
+    template_link_group = parser.add_mutually_exclusive_group()
+    template_link_group.add_argument(
+        "--link-templates",
+        dest="link_templates",
+        action="store_true",
+        default=True,
+        help="用 symlink/Junction 注册模板；这是默认行为。",
+    )
+    template_link_group.add_argument(
+        "--copy-templates",
+        dest="link_templates",
+        action="store_false",
+        help="复制生成后的模板，而不是创建链接。",
+    )
     parser.add_argument(
         "--template-dest",
         type=Path,

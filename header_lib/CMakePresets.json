@@ -15,12 +15,16 @@
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
       }
     },
-    // --- 1. Clang-CL + MSVC (Recommended Default) ---
     {
       "name": "clang-msvc-release",
       "displayName": "★ Clang-CL + MSVC [Release]",
-      "description": "Release build using Clang-CL.",
+      "description": "Release build using Clang-CL. Requires a VS developer environment for link.exe, rc.exe, mt.exe, and Windows SDK paths.",
       "inherits": "base",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/.deps/clang_msvc/Release/conan_toolchain.cmake"
@@ -29,18 +33,28 @@
     {
       "name": "clang-msvc-debug",
       "displayName": "★ Clang-CL + MSVC [Debug]",
-      "description": "Debug build using Clang-CL (Good for VS Debugger).",
+      "description": "Debug build using Clang-CL. Requires a VS developer environment for link.exe, rc.exe, mt.exe, and Windows SDK paths.",
       "inherits": "base",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/.deps/clang_msvc/Debug/conan_toolchain.cmake"
       }
     },
-    // --- 2. MSVC Native ---
     {
       "name": "msvc-release",
       "displayName": "MSVC Native [Release]",
+      "description": "Release build using cl.exe. Requires a VS developer environment for link.exe, rc.exe, mt.exe, and Windows SDK paths.",
       "inherits": "base",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/.deps/msvc/Release/conan_toolchain.cmake"
@@ -49,13 +63,18 @@
     {
       "name": "msvc-debug",
       "displayName": "MSVC Native [Debug]",
+      "description": "Debug build using cl.exe. Requires a VS developer environment for link.exe, rc.exe, mt.exe, and Windows SDK paths.",
       "inherits": "base",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/.deps/msvc/Debug/conan_toolchain.cmake"
       }
     },
-    // --- 3. Clang + libc++ (Strict) ---
     {
       "name": "clang-libcxx-release",
       "displayName": "Clang + libc++ [Release]",
@@ -75,7 +94,6 @@
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/.deps/clang/Debug/conan_toolchain.cmake"
       }
     },
-    // --- 4. Clang + libstdc++ ---
     {
       "name": "clang-std-release",
       "displayName": "Clang + libstdc++ [Release]",
@@ -94,7 +112,6 @@
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/.deps/clang_std/Debug/conan_toolchain.cmake"
       }
     },
-    // --- 5. GCC ---
     {
       "name": "gcc-release",
       "displayName": "GCC (MinGW) [Release]",

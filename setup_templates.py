@@ -1,5 +1,6 @@
 import os
 import argparse
+import json
 import platform
 import shutil
 import subprocess
@@ -8,12 +9,127 @@ from pathlib import Path
 
 
 TEMPLATE_NAMES = {"basic_exe", "basic_lib", "header_lib"}
+PRESET_GROUPS = ("clang-msvc", "msvc", "clang-libcxx", "clang-std", "gcc")
+GENERATED_TEMPLATE_ROOT = Path(".generated") / "conan_new_templates"
 
 
 def iter_template_dirs(source_root):
     for item in sorted(source_root.iterdir(), key=lambda path: path.name):
         if item.name in TEMPLATE_NAMES and item.is_dir():
             yield item
+
+
+def preset_group(name):
+    for group in PRESET_GROUPS:
+        if name.startswith(f"{group}-"):
+            return group
+    return None
+
+
+def filter_cmake_presets(template_dir, enabled_preset_groups):
+    if enabled_preset_groups is None:
+        return
+
+    preset_file = template_dir / "CMakePresets.json"
+    if not preset_file.exists():
+        return
+
+    try:
+        data = json.loads(preset_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"[!] 无法解析 {preset_file}，跳过 preset 过滤：{exc}")
+        return
+
+    configure_presets = []
+    kept_configure_names = set()
+    for preset in data.get("configurePresets", []):
+        name = preset.get("name", "")
+        group = preset_group(name)
+        if group and group not in enabled_preset_groups:
+            continue
+        configure_presets.append(preset)
+        kept_configure_names.add(name)
+    data["configurePresets"] = configure_presets
+
+    for key in ("buildPresets", "testPresets"):
+        filtered = []
+        for preset in data.get(key, []):
+            configure_preset = preset.get("configurePreset")
+            if configure_preset and configure_preset not in kept_configure_names:
+                continue
+            filtered.append(preset)
+        data[key] = filtered
+
+    preset_file.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    groups = ", ".join(sorted(enabled_preset_groups)) if enabled_preset_groups else "无"
+    print(f"[+] 已按可用工具链过滤 CMakePresets：{template_dir.name} ({groups})")
+
+
+def apply_preset_environments(template_dir, preset_environments):
+    if not preset_environments:
+        return
+
+    preset_file = template_dir / "CMakePresets.json"
+    if not preset_file.exists():
+        return
+
+    try:
+        data = json.loads(preset_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"[!] 无法解析 {preset_file}，跳过 preset 环境写入：{exc}")
+        return
+
+    changed = False
+    for preset in data.get("configurePresets", []):
+        group = preset_group(preset.get("name", ""))
+        environment = preset_environments.get(group)
+        if environment:
+            preset["environment"] = environment
+            changed = True
+
+    if changed:
+        preset_file.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"[+] 已写入 CMake preset 环境：{template_dir.name}")
+
+
+def prepare_generated_templates(source_root, enabled_preset_groups, preset_environments=None):
+    if enabled_preset_groups is None:
+        return source_root
+
+    generated_root = source_root / GENERATED_TEMPLATE_ROOT
+    if generated_root.exists():
+        shutil.rmtree(generated_root)
+    generated_root.mkdir(parents=True, exist_ok=True)
+
+    root_clang_format = source_root / ".clang-format"
+    for item in iter_template_dirs(source_root):
+        target = generated_root / item.name
+        shutil.copytree(
+            item,
+            target,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+        if root_clang_format.exists():
+            shutil.copy2(root_clang_format, target / ".clang-format")
+        filter_cmake_presets(target, enabled_preset_groups)
+        apply_preset_environments(target, preset_environments)
+
+    print(f"[+] 已生成本机 Conan 模板目录：{generated_root}")
+    return generated_root
+
+
+def remove_existing_template_target(target_path, dest_root):
+    resolved_dest = dest_root.resolve()
+    absolute_target = target_path.absolute()
+    if target_path.name not in TEMPLATE_NAMES:
+        raise ValueError(f"拒绝删除非模板目录：{target_path}")
+    if resolved_dest not in absolute_target.parents and absolute_target != resolved_dest:
+        raise ValueError(f"拒绝删除目标根目录之外的路径：{target_path}")
+
+    if target_path.is_symlink():
+        target_path.unlink()
+    elif target_path.exists():
+        shutil.rmtree(target_path)
 
 
 def install_clangd_format_scripts(source_root):
@@ -83,15 +199,17 @@ def install_clangd_format_scripts(source_root):
             print(f"[!] 写入 PowerShell 脚本 {ps1_script} 失败: {e}")
 
 
-def setup_templates(source_root=None, dest_root=None, link=False):
+def setup_templates(source_root=None, dest_root=None, link=False, enabled_preset_groups=None, preset_environments=None):
     source_root = Path(source_root or Path(__file__).parent).resolve()
     dest_root = Path(dest_root or "~/.conan2/templates/command/new").expanduser().resolve()
+    deploy_source_root = prepare_generated_templates(source_root, enabled_preset_groups, preset_environments)
 
     current_os = platform.system().lower()
     is_windows = current_os == "windows"
 
     print(f"[*] 检测到操作系统：{platform.system()}")
     print(f"[*] 源目录：{source_root}")
+    print(f"[*] 部署模板目录：{deploy_source_root}")
     print(f"[*] 目标目录：{dest_root}")
 
     # 1. 同步根目录下的 .clang-format 到各个模板目录和已部署目录
@@ -121,12 +239,16 @@ def setup_templates(source_root=None, dest_root=None, link=False):
             sys.exit(1)
 
     count = 0
-    for item in iter_template_dirs(source_root):
+    for item in iter_template_dirs(deploy_source_root):
         target_path = dest_root / item.name
 
         if target_path.exists() or target_path.is_symlink():
-            print(f"[-] 跳过：{item.name} (目标已存在)")
-            continue
+            try:
+                remove_existing_template_target(target_path, dest_root)
+                print(f"[+] 已替换旧模板入口：{item.name}")
+            except Exception as e:
+                print(f"[!] 无法替换旧模板入口 {item.name}: {e}")
+                continue
 
         try:
             if not link:
