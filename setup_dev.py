@@ -1045,20 +1045,9 @@ def ensure_conan_profile(check_only: bool) -> bool:
     profile = HOME / ".conan2" / "profiles" / "default"
     if profile.exists():
         ok(f"Conan default profile 已存在：{profile}")
-        return True
-
-    warn("未检测到 Conan default profile。")
-    if check_only:
-        warn("当前为仅检查模式，不会执行 conan profile detect。")
-        return False
-
-    result = run_command([conan, "profile", "detect", "--force"])
-    if result.returncode == 0:
-        ok("已生成 Conan default profile。")
-        return True
-
-    warn("Conan default profile 自动生成失败。请手动运行：conan profile detect --force")
-    return False
+    else:
+        log("提示：Conan default profile 不存在（已跳过自动生成，如需请手动运行 conan profile detect）。")
+    return True
 
 
 def ensure_tool(tool: Tool, uv: str | None, check_only: bool) -> bool:

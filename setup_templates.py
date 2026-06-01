@@ -126,10 +126,32 @@ def remove_existing_template_target(target_path, dest_root):
     if resolved_dest not in absolute_target.parents and absolute_target != resolved_dest:
         raise ValueError(f"拒绝删除目标根目录之外的路径：{target_path}")
 
-    if target_path.is_symlink():
-        target_path.unlink()
-    elif target_path.exists():
-        shutil.rmtree(target_path)
+    # 检测是否为符号链接或关接（Junction）
+    is_link = target_path.is_symlink() or os.path.islink(target_path)
+    if hasattr(target_path, "is_junction") and target_path.is_junction():
+        is_link = True
+
+    if is_link:
+        try:
+            target_path.unlink()
+            return
+        except Exception:
+            pass
+        # 在 Windows 上，目录联接（Junction）或目录符号链接可能需要用 rmdir 来删除
+        try:
+            target_path.rmdir()
+            return
+        except Exception:
+            pass
+
+    if target_path.exists():
+        # 再次尝试用 rmdir（如果是未被上面检测到的 Junction/符号链接）
+        try:
+            target_path.rmdir()
+            return
+        except OSError:
+            # 确为普通非空目录时才调用 rmtree
+            shutil.rmtree(target_path)
 
 
 def install_clangd_format_scripts(source_root):
