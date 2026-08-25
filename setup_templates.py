@@ -11,6 +11,7 @@ from pathlib import Path
 TEMPLATE_NAMES = {"basic_exe", "basic_lib", "header_lib"}
 PRESET_GROUPS = ("clang-msvc", "msvc", "clang-libcxx", "clang-std", "gcc")
 GENERATED_TEMPLATE_ROOT = Path(".generated") / "conan_new_templates"
+CONAN_HOME = Path(os.environ.get("CONAN_HOME", Path.home() / ".conan2")).expanduser()
 
 
 def iter_template_dirs(source_root):
@@ -158,9 +159,9 @@ def install_clangd_format_scripts(source_root):
     local_bin = Path("~/.local/bin").expanduser().resolve()
     local_bin.mkdir(parents=True, exist_ok=True)
     clang_format_path = source_root / ".clang-format"
-    
+
     if not clang_format_path.exists():
-        print(f"[!] 未找到根目录 .clang-format，跳过脚本生成。")
+        print("[!] 未找到根目录 .clang-format，跳过脚本生成。")
         return
 
     script_names = ["clangd_format", "clangd_foramt"]
@@ -171,13 +172,13 @@ def install_clangd_format_scripts(source_root):
         # Bash version
         bash_script = local_bin / name
         bash_content = (
-            f'#!/bin/sh\n'
+            f"#!/bin/sh\n"
             f'cp -f "{clang_format_path.as_posix()}" .\n'
-            f'if [ $? -eq 0 ]; then\n'
+            f"if [ $? -eq 0 ]; then\n"
             f'    echo "[完成] 已成功复制 .clang-format 到当前目录。"\n'
-            f'else\n'
+            f"else\n"
             f'    echo "[错误] 复制 .clang-format 失败。"\n'
-            f'fi\n'
+            f"fi\n"
         )
         try:
             bash_script.write_text(bash_content, encoding="utf-8")
@@ -190,13 +191,13 @@ def install_clangd_format_scripts(source_root):
         # Batch version
         bat_script = local_bin / f"{name}.bat"
         bat_content = (
-            f'@echo off\n'
+            f"@echo off\n"
             f'copy /Y "{clang_format_path}" . >nul\n'
-            f'if %errorlevel% equ 0 (\n'
-            f'    echo [完成] 已成功复制 .clang-format 到当前目录。\n'
-            f') else (\n'
-            f'    echo [错误] 复制 .clang-format 失败。\n'
-            f')\n'
+            f"if %errorlevel% equ 0 (\n"
+            f"    echo [完成] 已成功复制 .clang-format 到当前目录。\n"
+            f") else (\n"
+            f"    echo [错误] 复制 .clang-format 失败。\n"
+            f")\n"
         )
         try:
             bat_script.write_text(bat_content, encoding="utf-8")
@@ -208,11 +209,11 @@ def install_clangd_format_scripts(source_root):
         ps1_script = local_bin / f"{name}.ps1"
         ps1_content = (
             f'Copy-Item -Path "{clang_format_path}" -Destination . -Force\n'
-            f'if ($?) {{\n'
+            f"if ($?) {{\n"
             f'    Write-Host "[完成] 已成功复制 .clang-format 到当前目录。" -ForegroundColor Green\n'
-            f'}} else {{\n'
+            f"}} else {{\n"
             f'    Write-Host "[错误] 复制 .clang-format 失败。" -ForegroundColor Red\n'
-            f'}}\n'
+            f"}}\n"
         )
         try:
             ps1_script.write_text(ps1_content, encoding="utf-8")
@@ -223,7 +224,7 @@ def install_clangd_format_scripts(source_root):
 
 def setup_templates(source_root=None, dest_root=None, link=False, enabled_preset_groups=None, preset_environments=None):
     source_root = Path(source_root or Path(__file__).parent).resolve()
-    dest_root = Path(dest_root or "~/.conan2/templates/command/new").expanduser().resolve()
+    dest_root = Path(dest_root or CONAN_HOME / "templates" / "command" / "new").expanduser().resolve()
     deploy_source_root = prepare_generated_templates(source_root, enabled_preset_groups, preset_environments)
 
     current_os = platform.system().lower()
@@ -295,9 +296,7 @@ def setup_templates(source_root=None, dest_root=None, link=False, enabled_preset
                     print(f"[+] Windows Junction 创建成功：{item.name}")
                     count += 1
                 else:
-                    print(
-                        f"[!] Windows Junction 创建失败 {item.name}: {result.stderr.strip()}"
-                    )
+                    print(f"[!] Windows Junction 创建失败 {item.name}: {result.stderr.strip()}")
 
             else:
                 os.symlink(item, target_path)
@@ -309,10 +308,10 @@ def setup_templates(source_root=None, dest_root=None, link=False, enabled_preset
 
     action = "链接" if link else "复制"
     print(f"\n[*] 全部完成，共{action}了 {count} 个模板目录。")
-    
+
     # 3. 自动生成并安装 clangd_format 脚本到 ~/.local/bin
     install_clangd_format_scripts(source_root)
-    
+
     print("[*] 你可以使用 'conan new <folder_name>' 进行验证。")
 
 
@@ -327,7 +326,7 @@ def main(argv=None):
     parser.add_argument(
         "--dest-root",
         type=Path,
-        default=Path("~/.conan2/templates/command/new").expanduser(),
+        default=CONAN_HOME / "templates" / "command" / "new",
         help="Conan new 模板目标目录。",
     )
     parser.add_argument(

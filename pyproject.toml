@@ -1,0 +1,23 @@
+[project]
+name = "conan-cpp-templates-tooling"
+version = "0.1.0"
+description = "Reproducible tooling for the Conan C++ template collection"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+    "cmake>=3.23,<5",
+    "conan>=2,<3",
+    "ninja>=1.11,<2",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.11,<1",
+]
+
+[tool.uv]
+package = false
+required-version = ">=0.11,<0.12"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120

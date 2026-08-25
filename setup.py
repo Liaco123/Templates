@@ -32,13 +32,34 @@ def run_setup(args) -> int:
     print("========================================")
     print(f"[信息] 日志文件：{args.log_file}")
     print(f"[信息] 运行模式：{'仅检查' if args.check_only else '检查并补齐缺失项'}")
+    interactive = not args.non_interactive and sys.stdin.isatty()
 
     env_ok = True
     if args.skip_env:
         print("[警告] 已跳过开发环境检查。")
+        try:
+            setup_dev.LAST_TOOLCHAIN_SELECTION = setup_dev.resolve_toolchain_selection(
+                compiler=args.compiler,
+                stdlib=args.stdlib,
+                linker=args.linker,
+                interactive=interactive,
+            )
+        except ValueError as exc:
+            print(f"[错误] {exc}")
+            return 2
     else:
         print("\n[阶段] 1/2 检查并准备开发环境")
-        env_ok = setup_dev.setup_environment(check_only=args.check_only)
+        env_ok = setup_dev.setup_environment(
+            check_only=args.check_only,
+            compiler=args.compiler,
+            stdlib=args.stdlib,
+            linker=args.linker,
+            interactive=interactive,
+        )
+
+    if setup_dev.LAST_TOOLCHAIN_SELECTION is None:
+        print("[错误] 工具链选择无效，已停止模板注册。")
+        return 2
 
     if args.skip_templates:
         print("[警告] 已跳过 Conan 模板注册。")
@@ -47,9 +68,16 @@ def run_setup(args) -> int:
         if args.check_only:
             print("[信息] 仅检查模式不会复制或链接模板。")
         else:
-            enabled_preset_groups = setup_dev.LAST_AVAILABLE_PRESET_GROUPS or setup_dev.available_cmake_preset_groups()
-            preset_environments = setup_dev.LAST_PRESET_ENVIRONMENTS or setup_dev.cmake_preset_environments()
-            print(f"[信息] 可用 CMake preset 组：{', '.join(sorted(enabled_preset_groups)) if enabled_preset_groups else '无'}")
+            selection = setup_dev.LAST_TOOLCHAIN_SELECTION
+            enabled_preset_groups = setup_dev.LAST_AVAILABLE_PRESET_GROUPS or setup_dev.available_cmake_preset_groups(
+                selection=selection
+            )
+            preset_environments = setup_dev.LAST_PRESET_ENVIRONMENTS or setup_dev.cmake_preset_environments(
+                selection=selection
+            )
+            print(
+                f"[信息] 可用 CMake preset 组：{', '.join(sorted(enabled_preset_groups)) if enabled_preset_groups else '无'}"
+            )
             setup_templates.setup_templates(
                 dest_root=args.template_dest,
                 link=args.link_templates,
@@ -71,6 +99,29 @@ def main(argv=None) -> int:
     parser.add_argument("--check-only", action="store_true", help="只检查环境，不安装工具，不注册模板。")
     parser.add_argument("--skip-env", action="store_true", help="跳过开发环境检查和安装。")
     parser.add_argument("--skip-templates", action="store_true", help="跳过 Conan 模板注册。")
+    parser.add_argument(
+        "--compiler",
+        choices=("auto", "clang", "gcc", "msvc"),
+        default="auto",
+        help="选择编译器；默认 auto，在交互终端显示选择菜单。",
+    )
+    parser.add_argument(
+        "--stdlib",
+        choices=("auto", "libc++", "libstdc++", "msvc"),
+        default="auto",
+        help="选择 C++ 标准库；不兼容选项会被拒绝。",
+    )
+    parser.add_argument(
+        "--linker",
+        choices=("auto", "system", "lld", "bfd", "mold", "msvc"),
+        default="auto",
+        help="选择链接器；不兼容选项会被拒绝。",
+    )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="关闭选择菜单，对 auto 项使用当前系统的默认值。",
+    )
     template_link_group = parser.add_mutually_exclusive_group()
     template_link_group.add_argument(
         "--link-templates",
@@ -88,7 +139,7 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--template-dest",
         type=Path,
-        default=Path("~/.conan2/templates/command/new").expanduser(),
+        default=setup_dev.CONAN_HOME / "templates" / "command" / "new",
         help="Conan new 模板目标目录。",
     )
     parser.add_argument(
