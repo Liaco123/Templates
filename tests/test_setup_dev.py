@@ -88,6 +88,22 @@ class ToolchainSelectionTests(unittest.TestCase):
 
 
 class ToolchainManagementTests(unittest.TestCase):
+    def test_fetch_text_decodes_gzip_response(self):
+        class Response:
+            headers = {"Content-Encoding": "gzip"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return setup_dev.gzip.compress(b"llvm-toolchain-noble-22")
+
+        with patch("setup_dev.urllib.request.urlopen", return_value=Response()):
+            self.assertEqual(setup_dev.fetch_text("https://example.invalid/"), "llvm-toolchain-noble-22")
+
     def test_github_release_lookup_prefers_authenticated_gh(self):
         response = '[{"tag_name": "v1.2.3", "draft": false, "prerelease": false}]'
         with (
@@ -139,7 +155,14 @@ class ToolchainManagementTests(unittest.TestCase):
             requests,
             (
                 setup_dev.ToolchainInstallRequest("gcc", "15.3.0", True, "auto"),
-                setup_dev.ToolchainInstallRequest("llvm", "22.1.8", False, "mingw"),
+                setup_dev.ToolchainInstallRequest(
+                    "llvm",
+                    "22.1.8",
+                    False,
+                    "mingw",
+                    stdlib="libc++",
+                    linker="lld",
+                ),
             ),
         )
 
@@ -194,6 +217,124 @@ class ToolchainManagementTests(unittest.TestCase):
         self.assertIsNone(setup_dev.select_toolchain_release(releases, "20"))
         self.assertTrue(setup_dev.version_is_at_least("22.1.8", "22.1"))
         self.assertFalse(setup_dev.version_is_at_least("21.1.8", "22.1.0"))
+        self.assertEqual(setup_dev.semantic_version_key("22"), (22,))
+        self.assertEqual(setup_dev.semantic_version_key("1:18.0-59~exp2"), (18, 0))
+
+    def test_apt_llvm_page_lists_supported_noble_versions_and_channels(self):
+        page = """
+        deb https://apt.llvm.org/noble/ llvm-toolchain-noble main
+        deb https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main
+        deb https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main
+        Install (stable branch): apt-get install clang-21 lld-21
+        Install (qualification branch): apt-get install clang-22 lld-22
+        Install (development branch): apt-get install clang-23 lld-23
+        """
+
+        releases = setup_dev.apt_llvm_releases(page=page, codename="noble")
+
+        self.assertEqual([release.version for release in releases], ["23", "22", "21"])
+        self.assertEqual(releases[0].package_id, "llvm-toolchain-noble")
+        self.assertEqual(releases[1].package_id, "llvm-toolchain-noble-22")
+        self.assertIn("资格分支", releases[1].label)
+
+    def test_apt_package_versions_require_installable_compiler_pairs(self):
+        package_names = "\n".join(("gcc-13", "g++-13", "gcc-14", "clang-18", "clang-19"))
+
+        def capture(command, timeout=15):
+            if command[-1] == "pkgnames":
+                return SimpleNamespace(returncode=0, stdout=package_names)
+            return SimpleNamespace(returncode=0, stdout="  Candidate: 1:18.0-1\n")
+
+        with patch.object(setup_dev, "capture_command", side_effect=capture):
+            gcc_releases = setup_dev.apt_versioned_toolchain_releases("gcc")
+            llvm_releases = setup_dev.apt_versioned_toolchain_releases("llvm")
+
+        self.assertEqual([release.version for release in gcc_releases], ["13"])
+        self.assertEqual([release.version for release in llvm_releases], ["19", "18"])
+
+    def test_apt_llvm_install_uses_selected_compiler_stdlib_and_linker_versions(self):
+        release = setup_dev.ToolchainRelease(
+            "22",
+            "LLVM/Clang 22",
+            setup_dev.APT_LLVM_PROVIDER,
+            "https://apt.llvm.org/noble/",
+            package_id="llvm-toolchain-noble-22",
+        )
+        setup_dev.PREFERRED_LINKERS.clear()
+        with (
+            patch.object(setup_dev, "ensure_apt_llvm_repository", return_value=True),
+            patch.object(setup_dev, "install_system_packages", return_value=True) as install,
+            patch.object(setup_dev, "prefer_versioned_compiler", return_value=True),
+            patch.object(setup_dev, "versioned_executable", return_value=Path("/usr/bin/ld.lld-22")),
+        ):
+            installed = setup_dev.install_apt_llvm_release(release, stdlib="libc++", linker="lld")
+
+        self.assertTrue(installed)
+        install.assert_called_once_with(
+            ("clang-22", "libc++-22-dev", "libc++abi-22-dev", "lld-22"),
+            upgrade=True,
+        )
+        self.assertEqual(setup_dev.PREFERRED_LINKERS["lld"], Path("/usr/bin/ld.lld-22"))
+        setup_dev.PREFERRED_LINKERS.clear()
+
+    def test_apt_llvm_repository_rejects_untrusted_metadata_before_writing(self):
+        release = setup_dev.ToolchainRelease(
+            "22",
+            "LLVM/Clang 22",
+            setup_dev.APT_LLVM_PROVIDER,
+            "https://example.invalid/noble/",
+            package_id="llvm-toolchain-noble-22",
+        )
+        with patch.object(setup_dev, "run_command") as run:
+            self.assertFalse(setup_dev.ensure_apt_llvm_repository(release))
+        run.assert_not_called()
+
+    def test_linux_clang_selected_version_uses_apt_llvm_release(self):
+        release = setup_dev.ToolchainRelease(
+            "22",
+            "LLVM/Clang 22",
+            setup_dev.APT_LLVM_PROVIDER,
+            "https://apt.llvm.org/noble/",
+            package_id="llvm-toolchain-noble-22",
+        )
+        with (
+            patch.object(setup_dev, "installed_toolchain_version", return_value="18.1.3"),
+            patch.object(setup_dev, "is_windows", return_value=False),
+            patch.object(setup_dev, "detect_package_manager", return_value="apt-get"),
+            patch.object(setup_dev, "requested_release", return_value=release),
+            patch.object(setup_dev, "install_apt_llvm_release", return_value=True) as install,
+        ):
+            installed = setup_dev.install_clang(
+                False,
+                version="22",
+                upgrade=True,
+                stdlib="libstdc++",
+                linker="lld",
+            )
+
+        self.assertTrue(installed)
+        install.assert_called_once_with(release, stdlib="libstdc++", linker="lld")
+
+    def test_linux_gcc_selected_version_installs_matching_c_and_cpp_packages(self):
+        release = setup_dev.ToolchainRelease(
+            "14",
+            "GCC 14",
+            setup_dev.SYSTEM_PACKAGE_PROVIDER,
+            package_id="gcc-14",
+        )
+        with (
+            patch.object(setup_dev, "installed_toolchain_version", return_value="13.3.0"),
+            patch.object(setup_dev, "is_windows", return_value=False),
+            patch.object(setup_dev, "detect_package_manager", return_value="apt-get"),
+            patch.object(setup_dev, "requested_release", return_value=release),
+            patch.object(setup_dev, "install_system_packages", return_value=True) as install,
+            patch.object(setup_dev, "prefer_versioned_compiler", return_value=True),
+            patch.object(setup_dev, "find_gcc_pair", return_value=("/usr/bin/gcc-14", "/usr/bin/g++-14")),
+        ):
+            installed = setup_dev.install_gcc(False, version="14", upgrade=True)
+
+        self.assertTrue(installed)
+        install.assert_called_once_with(("gcc-14", "g++-14"), upgrade=True)
 
     def test_winlibs_releases_use_github_asset_version_and_digest(self):
         data = [

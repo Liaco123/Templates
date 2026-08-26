@@ -69,7 +69,20 @@ sh ./bootstrap.sh --compiler clang --stdlib libstdc++ --linker mold --non-intera
 
 未确认的现有工具链不会升级。Windows 会动态读取稳定发行版列表：GCC 使用 WinLibs GitHub Releases，LLVM 使用 llvm-project 或 llvm-mingw GitHub Releases，MSVC 优先使用 WinGet 中可用的 Visual Studio Build Tools 版本；没有 WinGet 时回退到 Microsoft 官方的 Visual Studio 2026/2022 evergreen bootstrapper。检测到已登录的 `gh` 时优先通过 `gh api` 读取 GitHub 发行版，避免匿名 API 限额；否则使用匿名 HTTPS。GitHub 资产校验发布方提供的 SHA-256，Microsoft bootstrapper 校验 Authenticode 发布者签名；归档工具链安装到版本目录，例如 `C:\dev\gcc\16.2.0`，不会覆盖其他版本。
 
-Linux 和 macOS 会根据本机已有包管理器安装其当前可用的最新版本。由于发行版软件包版本规则不同，当前只接受 `latest`，不把上游版本号强行映射为系统软件包版本。
+Ubuntu/Debian（包括 WSL）使用 APT 时也会列出具体版本：GCC 只显示仓库中同时存在 `gcc-N` 和 `g++-N` 的版本；LLVM 会合并当前 APT 仓库版本与 [apt.llvm.org](https://apt.llvm.org/) 针对当前发行版提供的稳定、资格和开发分支。选择 apt.llvm.org 版本后，脚本会验证官方软件源密钥指纹，再配置带 `signed-by` 限定的版本化软件源，并安装匹配的 `clang-N`；选择 lld 或 libc++ 时会同步安装相同主版本的 `lld-N`、`libc++-N-dev` 和 `libc++abi-N-dev`。其他 Linux 包管理器和 macOS 仍显示其系统仓库候选版本。
+
+例如，在 Ubuntu/WSL 上明确升级到 LLVM 22，并让 Clang 22 配合 GNU libstdc++ 与 lld 22：
+
+```sh
+sh ./bootstrap.sh \
+  --compiler clang \
+  --stdlib libstdc++ \
+  --linker lld \
+  --install-toolchain llvm \
+  --toolchain-version llvm=22 \
+  --upgrade-toolchains \
+  --non-interactive
+```
 
 无交互安装或升级多个工具链：
 

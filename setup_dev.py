@@ -1,5 +1,7 @@
 import argparse
+import gzip
 import hashlib
+import html
 import json
 import os
 import platform
@@ -27,6 +29,11 @@ DEV_ROOT = Path("C:/dev") if platform.system().lower() == "windows" else HOME / 
 GCC_DIR = DEV_ROOT / "gcc"
 CLANG_DIR = DEV_ROOT / "llvm-mingw"
 CLANG_MSVC_DIR = DEV_ROOT / "clang_msvc"
+APT_LLVM_BASE_URL = "https://apt.llvm.org"
+APT_LLVM_KEY_URL = f"{APT_LLVM_BASE_URL}/llvm-snapshot.gpg.key"
+APT_LLVM_KEY_FINGERPRINT = "6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
+APT_LLVM_PROVIDER = "apt.llvm.org"
+SYSTEM_PACKAGE_PROVIDER = "system-package-manager"
 CONAN_CPPSTD = "23"
 CONAN_CMAKE_GENERATOR = "Ninja"
 DEFAULT_MSVC_VERSION = "193"
@@ -89,6 +96,8 @@ LAST_AVAILABLE_PRESET_GROUPS: set[str] = set()
 LAST_PRESET_ENVIRONMENTS: dict[str, dict[str, str]] = {}
 LAST_TOOLCHAIN_SELECTION = None
 PREFERRED_TOOLCHAIN_BINS: dict[str, Path] = {}
+PREFERRED_COMPILER_PAIRS: dict[str, tuple[Path, Path]] = {}
+PREFERRED_LINKERS: dict[str, Path] = {}
 
 
 @dataclass(frozen=True)
@@ -124,6 +133,8 @@ class ToolchainInstallRequest:
     version: str = "latest"
     upgrade: bool = False
     llvm_variant: str = "auto"
+    stdlib: str = "auto"
+    linker: str = "auto"
 
 
 TOOLS = [
@@ -467,17 +478,22 @@ def fetch_text(url: str) -> str | None:
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "templates-setup"})
         with urllib.request.urlopen(request, timeout=30) as response:
-            return response.read().decode("utf-8", errors="replace")
-    except OSError as exc:
+            content = response.read()
+            content_encoding = response.headers.get("Content-Encoding", "").lower()
+            if content_encoding == "gzip" or content.startswith(b"\x1f\x8b"):
+                content = gzip.decompress(content)
+            return content.decode("utf-8", errors="replace")
+    except (OSError, EOFError) as exc:
         warn(f"读取页面失败：{exc}")
         return None
 
 
 def semantic_version_key(value: str) -> tuple[int, ...]:
-    match = re.search(r"(?<!\d)(\d+(?:\.\d+)+)(?!\d)", value)
-    if not match:
+    matches = re.findall(r"(?<!\d)(\d+(?:\.\d+)*)(?!\d)", value)
+    if not matches:
         return ()
-    return tuple(int(part) for part in match.group(1).split("."))
+    version = max(matches, key=lambda match: (match.count("."), len(match)))
+    return tuple(int(part) for part in version.split("."))
 
 
 def version_is_at_least(installed: str, target: str) -> bool:
@@ -730,6 +746,130 @@ def system_toolchain_candidate_version(toolchain: str, manager: str) -> str | No
     return None
 
 
+def apt_package_candidate(package: str) -> str | None:
+    apt_cache = shutil.which("apt-cache") or "apt-cache"
+    try:
+        result = capture_command([apt_cache, "policy", package])
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"^\s*Candidate:\s*(\S+)", result.stdout, re.MULTILINE | re.IGNORECASE)
+    if result.returncode != 0 or not match or match.group(1) == "(none)":
+        return None
+    return match.group(1)
+
+
+def apt_versioned_toolchain_releases(toolchain: str) -> tuple[ToolchainRelease, ...]:
+    apt_cache = shutil.which("apt-cache") or "apt-cache"
+    try:
+        result = capture_command([apt_cache, "pkgnames"], timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    if result.returncode != 0:
+        return ()
+
+    package_names = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    if toolchain == "gcc":
+        gcc_majors = {name.removeprefix("gcc-") for name in package_names if re.fullmatch(r"gcc-\d+", name)}
+        gxx_majors = {name.removeprefix("g++-") for name in package_names if re.fullmatch(r"g\+\+-\d+", name)}
+        majors = gcc_majors & gxx_majors
+        package_prefix = "gcc"
+        label = "GCC"
+    elif toolchain == "llvm":
+        majors = {name.removeprefix("clang-") for name in package_names if re.fullmatch(r"clang-\d+", name)}
+        package_prefix = "clang"
+        label = "LLVM/Clang"
+    else:
+        return ()
+
+    releases: list[ToolchainRelease] = []
+    for major in sorted(majors, key=semantic_version_key, reverse=True):
+        package = f"{package_prefix}-{major}"
+        candidate = apt_package_candidate(package)
+        if not candidate:
+            continue
+        releases.append(
+            ToolchainRelease(
+                version=major,
+                label=f"{label} {major}（APT 候选包 {candidate}）",
+                provider=SYSTEM_PACKAGE_PROVIDER,
+                package_id=package,
+            )
+        )
+    return tuple(releases)
+
+
+def linux_distribution_codename() -> str | None:
+    try:
+        release = platform.freedesktop_os_release()
+    except OSError:
+        return None
+    return release.get("VERSION_CODENAME") or release.get("UBUNTU_CODENAME") or None
+
+
+def apt_llvm_releases(page: str | None = None, codename: str | None = None) -> tuple[ToolchainRelease, ...]:
+    codename = codename or linux_distribution_codename()
+    if not codename:
+        return ()
+    page = page if page is not None else fetch_text(f"{APT_LLVM_BASE_URL}/")
+    if not page:
+        return ()
+
+    plain_text = html.unescape(re.sub(r"<[^>]+>", " ", page))
+    plain_text = re.sub(r"\s+", " ", plain_text)
+    suite_pattern = rf"llvm-toolchain-{re.escape(codename)}(?:-(\d+))?\s+main"
+    suite_matches = re.findall(suite_pattern, plain_text, re.IGNORECASE)
+    if not suite_matches:
+        return ()
+
+    channel_patterns = {
+        "稳定分支": r"Install\s+\(stable branch\).*?apt-get install clang-(\d+)",
+        "资格分支": r"Install\s+\(qualification branch\).*?apt-get install clang-(\d+)",
+        "开发分支": r"Install\s+\(development branch\).*?apt-get install clang-(\d+)",
+    }
+    channels: dict[str, str] = {}
+    for channel, pattern in channel_patterns.items():
+        match = re.search(pattern, plain_text, re.IGNORECASE)
+        if match:
+            channels[match.group(1)] = channel
+
+    versions = {match for match in suite_matches if match}
+    development = next((version for version, channel in channels.items() if channel == "开发分支"), None)
+    if "" in suite_matches and development:
+        versions.add(development)
+
+    releases: list[ToolchainRelease] = []
+    for version in versions:
+        channel = channels.get(version, "官方版本源")
+        suite = f"llvm-toolchain-{codename}"
+        if not (development == version and "" in suite_matches):
+            suite = f"{suite}-{version}"
+        releases.append(
+            ToolchainRelease(
+                version=version,
+                label=f"LLVM/Clang {version}（apt.llvm.org {channel}）",
+                provider=APT_LLVM_PROVIDER,
+                url=f"{APT_LLVM_BASE_URL}/{codename}/",
+                package_id=suite,
+            )
+        )
+    return unique_sorted_releases(releases)
+
+
+def system_package_toolchain_releases(toolchain: str, manager: str) -> tuple[ToolchainRelease, ...]:
+    releases = list(apt_versioned_toolchain_releases(toolchain)) if manager == "apt-get" else []
+    candidate = system_toolchain_candidate_version(toolchain, manager)
+    candidate_label = f"（候选版本 {candidate}）" if candidate else ""
+    releases.append(
+        ToolchainRelease(
+            version="system",
+            label=f"{manager} 系统默认版本{candidate_label}",
+            provider=SYSTEM_PACKAGE_PROVIDER,
+            package_id="gcc" if toolchain == "gcc" else "clang",
+        )
+    )
+    return unique_sorted_releases(releases)
+
+
 def available_toolchain_releases(
     toolchain: str,
     *,
@@ -739,15 +879,13 @@ def available_toolchain_releases(
     host = normalized_system(system)
     if host != "windows":
         manager = detect_package_manager() or "系统包管理器"
-        candidate = system_toolchain_candidate_version(toolchain, manager) if manager != "系统包管理器" else None
-        candidate_label = f"（候选版本 {candidate}）" if candidate else ""
-        return (
-            ToolchainRelease(
-                version="latest",
-                label=f"{manager} 当前可用的最新版本{candidate_label}",
-                provider=manager,
-            ),
-        )
+        if manager == "系统包管理器":
+            return (ToolchainRelease("system", "系统包管理器默认版本", SYSTEM_PACKAGE_PROVIDER),)
+        releases: list[ToolchainRelease] = []
+        if host == "linux" and manager == "apt-get" and toolchain == "llvm":
+            releases.extend(apt_llvm_releases())
+        releases.extend(system_package_toolchain_releases(toolchain, manager))
+        return unique_sorted_releases(releases)
     if toolchain == "gcc":
         return winlibs_releases()
     if toolchain == "llvm":
@@ -1034,6 +1172,9 @@ def find_gcc_pair() -> tuple[str, str] | None:
     exe_suffix = ".exe" if is_windows() else ""
     candidates: list[tuple[Path, Path]] = []
 
+    preferred_pair = PREFERRED_COMPILER_PAIRS.get("gcc")
+    if preferred_pair:
+        candidates.append(preferred_pair)
     preferred = PREFERRED_TOOLCHAIN_BINS.get("gcc")
     if preferred:
         candidates.append((preferred / f"gcc{exe_suffix}", preferred / f"g++{exe_suffix}"))
@@ -1073,6 +1214,9 @@ def find_clang_pair() -> tuple[str, str] | None:
     exe_suffix = ".exe" if is_windows() else ""
     candidates: list[tuple[Path, Path]] = []
 
+    preferred_pair = PREFERRED_COMPILER_PAIRS.get("clang")
+    if preferred_pair:
+        candidates.append(preferred_pair)
     preferred = PREFERRED_TOOLCHAIN_BINS.get("llvm-mingw")
     if preferred:
         candidates.append((preferred / f"clang{exe_suffix}", preferred / f"clang++{exe_suffix}"))
@@ -1462,6 +1606,8 @@ def prompt_toolchain_install_requests(
                 version=version,
                 upgrade=installed is not None,
                 llvm_variant=llvm_variant,
+                stdlib=selection.stdlib if toolchain == active_install_toolchain(selection) else "auto",
+                linker=selection.linker if toolchain == active_install_toolchain(selection) else "auto",
             )
         )
     return tuple(requests)
@@ -1512,6 +1658,8 @@ def noninteractive_toolchain_install_requests(
                 version=version_map.get(toolchain, "latest"),
                 upgrade=upgrade,
                 llvm_variant=variant,
+                stdlib=selection.stdlib if toolchain == active_install_toolchain(selection) else "auto",
+                linker=selection.linker if toolchain == active_install_toolchain(selection) else "auto",
             )
         )
     return tuple(requests)
@@ -1777,6 +1925,125 @@ def install_system_packages(packages: tuple[str, ...], *, upgrade: bool = False)
     return run_command(command).returncode == 0
 
 
+def verify_gpg_key_fingerprint(path: Path, expected: str) -> bool:
+    gpg = shutil.which("gpg")
+    if not gpg:
+        warn("未找到 gpg，无法验证 apt.llvm.org 软件源密钥。")
+        return False
+    try:
+        result = capture_command([gpg, "--show-keys", "--with-colons", str(path)])
+    except (OSError, subprocess.SubprocessError) as exc:
+        warn(f"读取 apt.llvm.org 软件源密钥失败：{exc}")
+        return False
+    fingerprints = re.findall(r"^fpr:::::::::([0-9A-F]+):", result.stdout, re.MULTILINE | re.IGNORECASE)
+    if result.returncode == 0 and expected.upper() in {fingerprint.upper() for fingerprint in fingerprints}:
+        ok("apt.llvm.org 软件源密钥指纹校验通过。")
+        return True
+    warn("apt.llvm.org 软件源密钥指纹不匹配，拒绝配置信任。")
+    return False
+
+
+def ensure_apt_llvm_repository(release: ToolchainRelease) -> bool:
+    if (
+        release.provider != APT_LLVM_PROVIDER
+        or not re.fullmatch(r"\d+", release.version)
+        or not release.url
+        or not release.url.startswith(f"{APT_LLVM_BASE_URL}/")
+        or not release.package_id
+        or not re.fullmatch(r"llvm-toolchain-[a-z0-9]+(?:-\d+)?", release.package_id)
+    ):
+        warn("apt.llvm.org 版本元数据无效，拒绝修改软件源。")
+        return False
+
+    if not shutil.which("gpg") and not install_system_packages(("ca-certificates", "gnupg")):
+        return False
+
+    key_path = Path("/usr/share/keyrings/apt.llvm.org.asc")
+    source_path = Path(f"/etc/apt/sources.list.d/apt-llvm-{release.version}.list")
+    source_line = f"deb [signed-by={key_path}] {release.url} {release.package_id} main\n"
+
+    key_ready = key_path.exists() and verify_gpg_key_fingerprint(key_path, APT_LLVM_KEY_FINGERPRINT)
+    source_ready = False
+    if source_path.exists():
+        try:
+            source_ready = source_path.read_text(encoding="utf-8") == source_line
+        except OSError:
+            source_ready = False
+    if key_ready and source_ready:
+        ok(f"apt.llvm.org LLVM {release.version} 软件源已配置。")
+        return True
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_root = Path(temp_dir)
+        key_download = temp_root / "llvm-snapshot.gpg.key"
+        source_file = temp_root / source_path.name
+        if not key_ready:
+            if not download_file(APT_LLVM_KEY_URL, key_download):
+                return False
+            if not verify_gpg_key_fingerprint(key_download, APT_LLVM_KEY_FINGERPRINT):
+                return False
+            install_program = shutil.which("install") or "install"
+            if run_command(
+                elevated_command([install_program, "-m", "0644", str(key_download), str(key_path)])
+            ).returncode:
+                return False
+        if not source_ready:
+            source_file.write_text(source_line, encoding="utf-8")
+            install_program = shutil.which("install") or "install"
+            if run_command(
+                elevated_command([install_program, "-m", "0644", str(source_file), str(source_path)])
+            ).returncode:
+                return False
+
+    ok(f"已配置 apt.llvm.org LLVM {release.version} 软件源：{release.package_id}")
+    return True
+
+
+def versioned_executable(name: str) -> Path | None:
+    found = shutil.which(name)
+    if found:
+        return Path(found)
+    candidate = Path("/usr/bin") / name
+    return candidate if candidate.exists() else None
+
+
+def prefer_versioned_compiler(toolchain: str, c_name: str, cpp_name: str) -> bool:
+    c_compiler = versioned_executable(c_name)
+    cpp_compiler = versioned_executable(cpp_name)
+    if not c_compiler or not cpp_compiler:
+        return False
+    PREFERRED_COMPILER_PAIRS[toolchain] = (c_compiler, cpp_compiler)
+    ok(f"已选择编译器：{c_compiler} / {cpp_compiler}")
+    return True
+
+
+def install_versioned_apt_llvm(version: str, *, stdlib: str = "auto", linker: str = "auto") -> bool:
+    packages = [f"clang-{version}"]
+    if stdlib == "libc++":
+        packages.extend((f"libc++-{version}-dev", f"libc++abi-{version}-dev"))
+    if linker == "lld":
+        packages.append(f"lld-{version}")
+    if not install_system_packages(tuple(packages), upgrade=True):
+        return False
+    if not prefer_versioned_compiler("clang", f"clang-{version}", f"clang++-{version}"):
+        warn(f"LLVM/Clang {version} 安装后未找到版本化编译器。")
+        return False
+    if linker == "lld":
+        preferred_lld = versioned_executable(f"ld.lld-{version}") or versioned_executable(f"lld-{version}")
+        if not preferred_lld:
+            warn(f"LLVM lld {version} 安装后仍不可用。")
+            return False
+        PREFERRED_LINKERS["lld"] = preferred_lld
+        ok(f"已选择链接器：{preferred_lld}")
+    return True
+
+
+def install_apt_llvm_release(release: ToolchainRelease, *, stdlib: str = "auto", linker: str = "auto") -> bool:
+    if not ensure_apt_llvm_repository(release):
+        return False
+    return install_versioned_apt_llvm(release.version, stdlib=stdlib, linker=linker)
+
+
 def packages_for(kind: str, manager: str) -> tuple[str, ...]:
     package_map = {
         "gcc": {
@@ -1901,8 +2168,29 @@ def install_gcc(check_only: bool, *, version: str | None = None, upgrade: bool =
         return False
 
     manager = detect_package_manager()
-    if version not in {None, "latest"}:
-        warn(f"{manager or '当前系统'} 暂不支持按上游版本号安装 GCC {version}；请使用 latest。")
+    requested_version = version or "latest"
+    if manager == "apt-get":
+        release = requested_release("gcc", requested_version)
+        if not release:
+            return False
+        if release.version == "system":
+            packages = packages_for("gcc", manager)
+        elif release.provider == SYSTEM_PACKAGE_PROVIDER and re.fullmatch(r"\d+", release.version):
+            packages = (f"gcc-{release.version}", f"g++-{release.version}")
+        else:
+            warn(f"无法解析 GCC {release.version} 的 APT 安装包。")
+            return False
+        if not install_system_packages(packages, upgrade=upgrade):
+            return False
+        if release.version != "system" and not prefer_versioned_compiler(
+            "gcc", f"gcc-{release.version}", f"g++-{release.version}"
+        ):
+            warn(f"GCC/G++ {release.version} 安装后未找到版本化编译器。")
+            return False
+        return bool(find_gcc_pair())
+
+    if requested_version not in {"latest", "system"}:
+        warn(f"{manager or '当前系统'} 暂不支持安装指定 GCC 版本 {requested_version}。")
         return False
     packages = packages_for("gcc", manager) if manager else ()
     if not packages:
@@ -1911,7 +2199,14 @@ def install_gcc(check_only: bool, *, version: str | None = None, upgrade: bool =
     return install_system_packages(packages, upgrade=upgrade) and bool(find_gcc_pair())
 
 
-def install_clang(check_only: bool, *, version: str | None = None, upgrade: bool = False) -> bool:
+def install_clang(
+    check_only: bool,
+    *,
+    version: str | None = None,
+    upgrade: bool = False,
+    stdlib: str = "auto",
+    linker: str = "auto",
+) -> bool:
     installed = installed_toolchain_version("llvm", "mingw" if is_windows() else "auto")
     if installed and not upgrade:
         ok(f"已检测到 Clang/Clang++ {installed}。")
@@ -1954,8 +2249,20 @@ def install_clang(check_only: bool, *, version: str | None = None, upgrade: bool
         return False
 
     manager = detect_package_manager()
-    if version not in {None, "latest"}:
-        warn(f"{manager or '当前系统'} 暂不支持按上游版本号安装 LLVM {version}；请使用 latest。")
+    requested_version = version or "latest"
+    if manager == "apt-get":
+        release = requested_release("llvm", requested_version)
+        if not release:
+            return False
+        if release.provider == APT_LLVM_PROVIDER:
+            return install_apt_llvm_release(release, stdlib=stdlib, linker=linker)
+        if release.version != "system" and re.fullmatch(r"\d+", release.version):
+            return install_versioned_apt_llvm(release.version, stdlib=stdlib, linker=linker)
+        packages = packages_for("clang", manager)
+        return install_system_packages(packages, upgrade=upgrade) and bool(find_clang_pair())
+
+    if requested_version not in {"latest", "system"}:
+        warn(f"{manager or '当前系统'} 暂不支持安装指定 LLVM 版本 {requested_version}。")
         return False
     if normalized_system() == "darwin" and manager != "brew":
         warn("未检测到 Homebrew；请先安装 Homebrew，或使用 xcode-select --install 安装系统 Clang。")
@@ -2106,6 +2413,9 @@ def selected_compiler_executables(selection: ToolchainSelection) -> tuple[str, s
 
 
 def find_lld(selection: ToolchainSelection | None = None) -> Path | None:
+    preferred = PREFERRED_LINKERS.get("lld")
+    if preferred and preferred.exists():
+        return preferred
     if is_windows():
         msvc_abi = selection and selection_compiler_mode(selection) in {"msvc", "clang_msvc"}
         names = ("lld-link.exe",) if msvc_abi else ("ld.lld.exe", "lld.exe")
@@ -2272,7 +2582,13 @@ def install_toolchain_request(request: ToolchainInstallRequest, check_only: bool
     if request.toolchain == "llvm":
         if request.llvm_variant == "msvc":
             return install_clang_msvc(check_only, version=request.version, upgrade=request.upgrade)
-        return install_clang(check_only, version=request.version, upgrade=request.upgrade)
+        return install_clang(
+            check_only,
+            version=request.version,
+            upgrade=request.upgrade,
+            stdlib=request.stdlib,
+            linker=request.linker,
+        )
     if request.toolchain == "msvc":
         return install_msvc(check_only, version=request.version, upgrade=request.upgrade)
     raise ValueError(f"未知工具链：{request.toolchain}")
@@ -2611,6 +2927,8 @@ def setup_environment(
 
     LAST_TOOLCHAIN_SELECTION = None
     PREFERRED_TOOLCHAIN_BINS.clear()
+    PREFERRED_COMPILER_PAIRS.clear()
+    PREFERRED_LINKERS.clear()
     try:
         selection = selection or resolve_toolchain_selection(
             compiler=compiler,
