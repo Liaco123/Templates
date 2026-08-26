@@ -55,6 +55,10 @@ def run_setup(args) -> int:
             stdlib=args.stdlib,
             linker=args.linker,
             interactive=interactive,
+            install_toolchains=tuple(args.install_toolchain),
+            toolchain_versions=args.toolchain_versions,
+            upgrade_toolchains=args.upgrade_toolchains,
+            llvm_variant=args.llvm_variant,
         )
 
     if setup_dev.LAST_TOOLCHAIN_SELECTION is None:
@@ -118,6 +122,27 @@ def main(argv=None) -> int:
         help="选择链接器；不兼容选项会被拒绝。",
     )
     parser.add_argument(
+        "--install-toolchain",
+        action="append",
+        choices=("gcc", "llvm", "msvc"),
+        default=[],
+        help="显式安装/管理工具链，可重复指定；交互模式默认逐项询问。",
+    )
+    parser.add_argument(
+        "--toolchain-version",
+        action="append",
+        default=[],
+        metavar="NAME=VERSION",
+        help="指定工具链版本，例如 gcc=16.2.0；可重复指定。",
+    )
+    parser.add_argument("--upgrade-toolchains", action="store_true", help="允许升级所选的现有工具链。")
+    parser.add_argument(
+        "--llvm-variant",
+        choices=("auto", "mingw", "msvc"),
+        default="auto",
+        help="Windows LLVM 运行模式；auto 根据标准库选择。",
+    )
+    parser.add_argument(
         "--non-interactive",
         action="store_true",
         help="关闭选择菜单，对 auto 项使用当前系统的默认值。",
@@ -149,6 +174,10 @@ def main(argv=None) -> int:
         help="日志目录，默认写入当前项目的 logs 目录。",
     )
     args = parser.parse_args(argv)
+    try:
+        args.toolchain_versions = setup_dev.parse_toolchain_versions(args.toolchain_version)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     args.log_dir.mkdir(parents=True, exist_ok=True)
     args.log_file = default_log_file(args.log_dir)

@@ -25,7 +25,7 @@ sh ./bootstrap.sh
 1. 在缺少 uv 时安装仓库指定的 uv 版本；
 2. 按 `uv.lock` 创建 `.venv`；
 3. 从锁文件读取版本，通过 `uv tool` 全局安装 Conan、CMake、Ninja 和 Ruff；
-4. 交互选择并检查或安装 C/C++ 编译器、C++ 标准库和链接器；
+4. 交互选择项目默认的编译器、C++ 标准库和链接器，再逐项选择是否安装或升级 GCC、LLVM 和 MSVC；
 5. 把所选标准库和链接器写入 Conan profile，并只注册匹配的 CMake presets。
 
 Python 默认由 `.python-version` 固定为 3.12（脚本兼容 3.12–3.14）；如果本机没有该版本，uv 会自动准备隔离的 Python。交互终端会显示当前平台有效的选项，不兼容组合不会出现在菜单中：
@@ -57,6 +57,49 @@ sh ./bootstrap.sh --compiler clang --stdlib libstdc++ --linker mold --non-intera
 - `--linker`: `auto`、`system`、`lld`、`bfd`、`mold`、`msvc`
 
 `auto` 在交互终端中表示显示菜单；配合 `--non-interactive` 时，会优先复用本机已有工具链，否则采用系统默认组合。
+
+### 编译器安装、版本选择与升级
+
+交互运行时，脚本会显示每项工具链的已安装版本，并分别询问：
+
+1. 是否安装或管理 GCC；
+2. 是否安装或管理 LLVM；Windows 上还会区分 llvm-mingw（clang++/libc++）与 clang-cl/MSVC；
+3. Windows 上是否安装或管理 MSVC Build Tools；
+4. 已安装工具链是否升级或切换版本。
+
+未确认的现有工具链不会升级。Windows 会动态读取稳定发行版列表：GCC 使用 WinLibs GitHub Releases，LLVM 使用 llvm-project 或 llvm-mingw GitHub Releases，MSVC 优先使用 WinGet 中可用的 Visual Studio Build Tools 版本；没有 WinGet 时回退到 Microsoft 官方的 Visual Studio 2026/2022 evergreen bootstrapper。检测到已登录的 `gh` 时优先通过 `gh api` 读取 GitHub 发行版，避免匿名 API 限额；否则使用匿名 HTTPS。GitHub 资产校验发布方提供的 SHA-256，Microsoft bootstrapper 校验 Authenticode 发布者签名；归档工具链安装到版本目录，例如 `C:\dev\gcc\16.2.0`，不会覆盖其他版本。
+
+Linux 和 macOS 会根据本机已有包管理器安装其当前可用的最新版本。由于发行版软件包版本规则不同，当前只接受 `latest`，不把上游版本号强行映射为系统软件包版本。
+
+无交互安装或升级多个工具链：
+
+```powershell
+.\bootstrap.ps1 `
+  -InstallToolchain gcc,llvm `
+  -ToolchainVersion "gcc=16.2.0","llvm=22.1.8" `
+  -UpgradeToolchains `
+  -LlvmVariant mingw `
+  -NonInteractive
+```
+
+```sh
+sh ./bootstrap.sh \
+  --install-toolchain gcc \
+  --install-toolchain llvm \
+  --toolchain-version gcc=16.2.0 \
+  --toolchain-version llvm=22.1.8 \
+  --upgrade-toolchains \
+  --non-interactive
+```
+
+相关参数：
+
+- `--install-toolchain`: `gcc`、`llvm`、`msvc`，可重复指定；
+- `--toolchain-version NAME=VERSION`: 为已选择的工具链指定 `latest`、主版本或完整版本；
+- `--upgrade-toolchains`: 允许修改已有安装；省略 `--install-toolchain` 时升级主工具链所必需的编译器组件；
+- `--llvm-variant`: Windows 可选 `auto`、`mingw`、`msvc`。
+
+只指定安装目标但不加 `--upgrade-toolchains` 时，已安装工具链保持不变；未安装工具链仍会安装。MSVC 只在 Windows 上可选。
 
 只诊断项目环境、全局 uv tools 和宿主工具链，不执行安装或模板注册：
 

@@ -11,6 +11,12 @@ param(
     [string]$Stdlib = "auto",
     [ValidateSet("auto", "system", "lld", "bfd", "mold", "msvc")]
     [string]$Linker = "auto",
+    [ValidateSet("gcc", "llvm", "msvc")]
+    [string[]]$InstallToolchain = @(),
+    [string[]]$ToolchainVersion = @(),
+    [switch]$UpgradeToolchains,
+    [ValidateSet("auto", "mingw", "msvc")]
+    [string]$LlvmVariant = "auto",
     [switch]$NonInteractive
 )
 
@@ -62,6 +68,10 @@ if ($SkipTemplates) { $setupArgs += "--skip-templates" }
 if ($CopyTemplates) { $setupArgs += "--copy-templates" }
 if ($TemplateDest) { $setupArgs += @("--template-dest", $TemplateDest) }
 $setupArgs += @("--compiler", $Compiler, "--stdlib", $Stdlib, "--linker", $Linker)
+foreach ($toolchain in $InstallToolchain) { $setupArgs += @("--install-toolchain", $toolchain) }
+foreach ($version in $ToolchainVersion) { $setupArgs += @("--toolchain-version", $version) }
+if ($UpgradeToolchains) { $setupArgs += "--upgrade-toolchains" }
+$setupArgs += @("--llvm-variant", $LlvmVariant)
 if ($NonInteractive) { $setupArgs += "--non-interactive" }
 
 Write-Host "[bootstrap] Initializing the development environment and Conan templates."

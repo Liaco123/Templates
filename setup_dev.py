@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -36,6 +37,33 @@ COMPILER_LABELS = {
     "gcc": "GCC",
     "msvc": "Microsoft MSVC",
 }
+TOOLCHAIN_LABELS = {
+    "gcc": "GCC",
+    "llvm": "LLVM/Clang",
+    "msvc": "Microsoft MSVC Build Tools",
+}
+LLVM_VARIANT_LABELS = {
+    "mingw": "LLVM/MinGW（clang++ + libc++）",
+    "msvc": "LLVM/MSVC（clang-cl + Microsoft STL）",
+}
+MSVC_WINGET_PACKAGES = (
+    ("Visual Studio 2026 Build Tools", "Microsoft.VisualStudio.BuildTools"),
+    ("Visual Studio 2022 Build Tools", "Microsoft.VisualStudio.2022.BuildTools"),
+)
+MSVC_BOOTSTRAPPERS = (
+    (
+        "18",
+        "Visual Studio 2026 Build Tools（Stable 通道最新服务版本）",
+        "https://aka.ms/vs/stable/vs_buildtools.exe",
+        "https://aka.ms/vs/stable/channel",
+    ),
+    (
+        "17",
+        "Visual Studio 2022 Build Tools（Current 通道最新服务版本）",
+        "https://aka.ms/vs/17/release/vs_buildtools.exe",
+        "https://aka.ms/vs/17/release/channel",
+    ),
+)
 STDLIB_LABELS = {
     "libc++": "LLVM libc++",
     "libstdc++": "GNU libstdc++",
@@ -60,6 +88,7 @@ CMAKE_LINKER_TYPES = {
 LAST_AVAILABLE_PRESET_GROUPS: set[str] = set()
 LAST_PRESET_ENVIRONMENTS: dict[str, dict[str, str]] = {}
 LAST_TOOLCHAIN_SELECTION = None
+PREFERRED_TOOLCHAIN_BINS: dict[str, Path] = {}
 
 
 @dataclass(frozen=True)
@@ -77,6 +106,24 @@ class ToolchainSelection:
     compiler: str
     stdlib: str
     linker: str
+
+
+@dataclass(frozen=True)
+class ToolchainRelease:
+    version: str
+    label: str
+    provider: str
+    url: str | None = None
+    digest: str | None = None
+    package_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ToolchainInstallRequest:
+    toolchain: str
+    version: str = "latest"
+    upgrade: bool = False
+    llvm_variant: str = "auto"
 
 
 TOOLS = [
@@ -230,6 +277,44 @@ def prompt_choice(title: str, choices: tuple[str, ...], labels: dict[str, str], 
         warn(f"无效选择：{raw or '<空>'}。可选值：{', '.join(choices)}")
 
 
+def prompt_yes_no(question: str, *, default: bool = False, input_fn=input) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    while True:
+        raw = input_fn(f"{question} {suffix}：").strip().lower()
+        if not raw:
+            return default
+        if raw in {"y", "yes", "是"}:
+            return True
+        if raw in {"n", "no", "否"}:
+            return False
+        warn("请输入 y/yes 或 n/no。")
+
+
+def supported_install_toolchains(system: str | None = None) -> tuple[str, ...]:
+    if normalized_system(system) == "windows":
+        return ("gcc", "llvm", "msvc")
+    return ("gcc", "llvm")
+
+
+def active_install_toolchain(selection: ToolchainSelection) -> str:
+    return "llvm" if selection.compiler == "clang" else selection.compiler
+
+
+def required_install_toolchains(selection: ToolchainSelection, system: str | None = None) -> tuple[str, ...]:
+    active = active_install_toolchain(selection)
+    if active == "llvm" and llvm_variant_for_selection(selection, system) == "msvc":
+        return ("llvm", "msvc")
+    return (active,)
+
+
+def llvm_variant_for_selection(selection: ToolchainSelection, system: str | None = None) -> str:
+    if normalized_system(system) != "windows":
+        return "auto"
+    if selection.compiler == "clang" and selection.stdlib == "msvc":
+        return "msvc"
+    return "mingw"
+
+
 def resolve_toolchain_selection(
     compiler: str = "auto",
     stdlib: str = "auto",
@@ -323,12 +408,58 @@ def download_file(url: str, destination: Path) -> bool:
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "templates-setup"})
         with urllib.request.urlopen(request, timeout=60) as response:
-            destination.write_bytes(response.read())
+            with destination.open("wb") as output:
+                shutil.copyfileobj(response, output)
     except OSError as exc:
         warn(f"下载失败：{exc}")
         return False
     ok(f"下载完成：{destination}")
     return True
+
+
+def verify_file_digest(path: Path, digest: str | None) -> bool:
+    if not digest:
+        warn(f"下载源没有提供校验摘要：{path.name}")
+        return True
+    algorithm, separator, expected = digest.partition(":")
+    if separator != ":" or algorithm.lower() != "sha256" or not expected:
+        warn(f"不支持的下载摘要格式：{digest}")
+        return False
+    hasher = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                hasher.update(chunk)
+    except OSError as exc:
+        warn(f"读取下载文件进行校验失败：{exc}")
+        return False
+    if hasher.hexdigest().lower() != expected.lower():
+        warn(f"SHA-256 校验失败：{path.name}")
+        return False
+    ok(f"SHA-256 校验通过：{path.name}")
+    return True
+
+
+def verify_microsoft_authenticode(path: Path) -> bool:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if not powershell:
+        warn("无法找到 PowerShell，不能验证 Microsoft 安装器签名。")
+        return False
+    script = (
+        "$signature = Get-AuthenticodeSignature -LiteralPath $args[0]; "
+        'Write-Output "$($signature.Status)|$($signature.SignerCertificate.Subject)"'
+    )
+    try:
+        result = capture_command([powershell, "-NoProfile", "-Command", script, str(path)], timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        warn(f"验证 Microsoft 安装器签名失败：{exc}")
+        return False
+    output = result.stdout.strip()
+    if result.returncode == 0 and output.startswith("Valid|") and "Microsoft Corporation" in output:
+        ok(f"Microsoft Authenticode 签名校验通过：{path.name}")
+        return True
+    warn(f"Microsoft Authenticode 签名无效：{output or '无签名信息'}")
+    return False
 
 
 def fetch_text(url: str) -> str | None:
@@ -340,6 +471,309 @@ def fetch_text(url: str) -> str | None:
     except OSError as exc:
         warn(f"读取页面失败：{exc}")
         return None
+
+
+def semantic_version_key(value: str) -> tuple[int, ...]:
+    match = re.search(r"(?<!\d)(\d+(?:\.\d+)+)(?!\d)", value)
+    if not match:
+        return ()
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def version_is_at_least(installed: str, target: str) -> bool:
+    installed_key = semantic_version_key(installed)
+    target_key = semantic_version_key(target)
+    if not installed_key or not target_key:
+        return False
+    length = max(len(installed_key), len(target_key))
+    return installed_key + (0,) * (length - len(installed_key)) >= target_key + (0,) * (length - len(target_key))
+
+
+def github_release_items(repository: str, limit: int = 20) -> list[dict]:
+    text = None
+    gh = shutil.which("gh")
+    if gh:
+        try:
+            result = capture_command([gh, "api", f"repos/{repository}/releases?per_page={limit}"], timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            result = None
+        if result and result.returncode == 0:
+            log(f"通过 gh 读取 {repository} release 列表。")
+            text = result.stdout
+    if not text:
+        text = fetch_text(f"https://api.github.com/repos/{repository}/releases?per_page={limit}")
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        warn(f"解析 {repository} GitHub release JSON 失败。")
+        return []
+    if not isinstance(data, list):
+        warn(f"{repository} GitHub release 响应格式无效。")
+        return []
+    return [item for item in data if isinstance(item, dict) and not item.get("draft") and not item.get("prerelease")]
+
+
+def release_asset(release: dict, predicate) -> dict | None:
+    for asset in release.get("assets", []):
+        if isinstance(asset, dict) and predicate(asset):
+            return asset
+    return None
+
+
+def release_from_asset(version: str, label: str, provider: str, asset: dict) -> ToolchainRelease:
+    return ToolchainRelease(
+        version=version,
+        label=label,
+        provider=provider,
+        url=asset.get("browser_download_url") or None,
+        digest=asset.get("digest") or None,
+    )
+
+
+def unique_sorted_releases(releases: list[ToolchainRelease]) -> tuple[ToolchainRelease, ...]:
+    ordered = sorted(releases, key=lambda item: semantic_version_key(item.version), reverse=True)
+    unique: dict[str, ToolchainRelease] = {}
+    for release in ordered:
+        unique.setdefault(release.version, release)
+    return tuple(unique.values())
+
+
+def winlibs_releases(limit: int = 12) -> tuple[ToolchainRelease, ...]:
+    arch = conan_host_arch()
+    asset_arch = "i686" if arch == "x86" else "x86_64" if arch == "x86_64" else ""
+    if not asset_arch:
+        warn(f"WinLibs 暂不支持当前架构：{arch}")
+        return ()
+
+    releases: list[ToolchainRelease] = []
+    for release in github_release_items("brechtsanders/winlibs_mingw", limit):
+        asset = release_asset(
+            release,
+            lambda item: (
+                item.get("name", "").lower().startswith(f"winlibs-{asset_arch}-posix-")
+                and item.get("name", "").lower().endswith(".zip")
+            ),
+        )
+        if not asset:
+            continue
+        match = re.search(r"gcc-(\d+(?:\.\d+)+)-", asset.get("name", ""), re.IGNORECASE)
+        if not match:
+            continue
+        version = match.group(1)
+        releases.append(
+            release_from_asset(
+                version,
+                f"GCC {version}（WinLibs / MinGW-w64 UCRT）",
+                "WinLibs GitHub Releases",
+                asset,
+            )
+        )
+    return unique_sorted_releases(releases)
+
+
+def llvm_mingw_releases(limit: int = 12) -> tuple[ToolchainRelease, ...]:
+    arch = conan_host_arch()
+    asset_arch = {"x86_64": "x86_64", "x86": "i686", "armv8": "aarch64", "armv7": "armv7"}.get(arch)
+    if not asset_arch:
+        warn(f"llvm-mingw 暂不支持当前架构：{arch}")
+        return ()
+
+    releases: list[ToolchainRelease] = []
+    for release in github_release_items("mstorsjo/llvm-mingw", limit):
+        description = f"{release.get('name', '')} {release.get('tag_name', '')}"
+        match = re.search(r"LLVM\s+(\d+(?:\.\d+)+)", description, re.IGNORECASE)
+        if not match:
+            continue
+        version = match.group(1)
+        suffix = f"ucrt-{asset_arch}.zip"
+        asset = release_asset(release, lambda item: item.get("name", "").lower().endswith(suffix))
+        if not asset:
+            continue
+        release_tag = release.get("tag_name", "")
+        releases.append(
+            release_from_asset(
+                version,
+                f"LLVM {version}（llvm-mingw {release_tag}）",
+                "mstorsjo/llvm-mingw GitHub Releases",
+                asset,
+            )
+        )
+    return unique_sorted_releases(releases)
+
+
+def llvm_msvc_releases(limit: int = 12) -> tuple[ToolchainRelease, ...]:
+    arch = conan_host_arch()
+    suffix = "-woa64.exe" if arch == "armv8" else "-win64.exe" if arch == "x86_64" else ""
+    if not suffix:
+        warn(f"LLVM Windows 官方安装器暂不支持当前架构：{arch}")
+        return ()
+
+    releases: list[ToolchainRelease] = []
+    for release in github_release_items("llvm/llvm-project", limit):
+        match = re.search(r"llvmorg-(\d+(?:\.\d+)+)", release.get("tag_name", ""), re.IGNORECASE)
+        if not match:
+            continue
+        version = match.group(1)
+        asset = release_asset(
+            release,
+            lambda item: item.get("name", "").lower() == f"llvm-{version}{suffix}".lower(),
+        )
+        if not asset:
+            continue
+        releases.append(
+            release_from_asset(
+                version,
+                f"LLVM {version}（官方 Windows MSVC 工具链）",
+                "llvm/llvm-project GitHub Releases",
+                asset,
+            )
+        )
+    return unique_sorted_releases(releases)
+
+
+def winget_package_versions(package_id: str, label: str, limit: int = 8) -> tuple[ToolchainRelease, ...]:
+    winget = shutil.which("winget")
+    if not winget:
+        return ()
+    try:
+        result = capture_command(
+            [
+                winget,
+                "show",
+                "--id",
+                package_id,
+                "-e",
+                "--source",
+                "winget",
+                "--versions",
+                "--accept-source-agreements",
+            ],
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    if result.returncode != 0:
+        return ()
+
+    versions = {line.strip() for line in result.stdout.splitlines() if re.fullmatch(r"\d+(?:\.\d+){1,3}", line.strip())}
+    ordered = sorted(versions, key=semantic_version_key, reverse=True)[:limit]
+    return tuple(
+        ToolchainRelease(
+            version=version,
+            label=f"{label} {version}",
+            provider="WinGet",
+            package_id=package_id,
+        )
+        for version in ordered
+    )
+
+
+def msvc_bootstrapper_releases() -> tuple[ToolchainRelease, ...]:
+    releases: list[ToolchainRelease] = []
+    for major, label, installer_url, channel_url in MSVC_BOOTSTRAPPERS:
+        version = major
+        text = fetch_text(channel_url)
+        if text:
+            try:
+                data = json.loads(text)
+                display_version = str(data.get("info", {}).get("productDisplayVersion", ""))
+                match = re.search(r"\d+(?:\.\d+)+", display_version)
+                if match and match.group(0).startswith(f"{major}."):
+                    version = match.group(0)
+            except json.JSONDecodeError:
+                warn(f"解析 Visual Studio {major} channel manifest 失败。")
+        releases.append(
+            ToolchainRelease(
+                version=version,
+                label=f"{label}：{version}",
+                provider="Microsoft Visual Studio evergreen bootstrapper",
+                url=installer_url,
+            )
+        )
+    return tuple(releases)
+
+
+def system_toolchain_candidate_version(toolchain: str, manager: str) -> str | None:
+    package = "gcc" if toolchain == "gcc" else "llvm" if manager == "brew" else "clang"
+    try:
+        if manager == "brew":
+            result = capture_command([shutil.which("brew") or "brew", "info", "--json=v2", package], timeout=60)
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                formulae = data.get("formulae", [])
+                stable = formulae[0].get("versions", {}).get("stable") if formulae else None
+                return str(stable) if stable else None
+        elif manager == "apt-get":
+            apt_cache = shutil.which("apt-cache") or "apt-cache"
+            result = capture_command([apt_cache, "policy", "gcc" if toolchain == "gcc" else "clang"])
+            match = re.search(r"^\s*Candidate:\s*(\S+)", result.stdout, re.MULTILINE | re.IGNORECASE)
+            return match.group(1) if result.returncode == 0 and match else None
+        elif manager == "dnf":
+            result = capture_command(
+                [manager, "repoquery", "--latest-limit", "1", "--qf", "%{version}", package],
+                timeout=60,
+            )
+            versions = [line.strip() for line in result.stdout.splitlines() if semantic_version_key(line.strip())]
+            return versions[-1] if result.returncode == 0 and versions else None
+        elif manager == "pacman":
+            result = capture_command([manager, "-Sp", "--print-format", "%v", package], timeout=60)
+            versions = [line.strip() for line in result.stdout.splitlines() if semantic_version_key(line.strip())]
+            return versions[-1] if result.returncode == 0 and versions else None
+        elif manager == "zypper":
+            result = capture_command([manager, "--non-interactive", "info", package], timeout=60)
+            match = re.search(r"^\s*Version\s*:\s*(\S+)", result.stdout, re.MULTILINE | re.IGNORECASE)
+            return match.group(1) if result.returncode == 0 and match else None
+    except (json.JSONDecodeError, OSError, subprocess.SubprocessError):
+        return None
+    return None
+
+
+def available_toolchain_releases(
+    toolchain: str,
+    *,
+    llvm_variant: str = "auto",
+    system: str | None = None,
+) -> tuple[ToolchainRelease, ...]:
+    host = normalized_system(system)
+    if host != "windows":
+        manager = detect_package_manager() or "系统包管理器"
+        candidate = system_toolchain_candidate_version(toolchain, manager) if manager != "系统包管理器" else None
+        candidate_label = f"（候选版本 {candidate}）" if candidate else ""
+        return (
+            ToolchainRelease(
+                version="latest",
+                label=f"{manager} 当前可用的最新版本{candidate_label}",
+                provider=manager,
+            ),
+        )
+    if toolchain == "gcc":
+        return winlibs_releases()
+    if toolchain == "llvm":
+        return llvm_msvc_releases() if llvm_variant == "msvc" else llvm_mingw_releases()
+    if toolchain == "msvc":
+        releases: list[ToolchainRelease] = []
+        for label, package_id in MSVC_WINGET_PACKAGES:
+            releases.extend(winget_package_versions(package_id, label))
+        releases.extend(msvc_bootstrapper_releases())
+        return unique_sorted_releases(releases)
+    raise ValueError(f"未知工具链：{toolchain}")
+
+
+def select_toolchain_release(
+    releases: tuple[ToolchainRelease, ...],
+    requested_version: str,
+) -> ToolchainRelease | None:
+    if not releases:
+        return None
+    if requested_version == "latest":
+        return releases[0]
+    exact = next((release for release in releases if release.version == requested_version), None)
+    if exact:
+        return exact
+    prefix = f"{requested_version}."
+    return next((release for release in releases if release.version.startswith(prefix)), None)
 
 
 def find_first_child_with_bin(root: Path, executable: str) -> Path | None:
@@ -378,15 +812,26 @@ def install_zip_to_dir(archive: Path, install_dir: Path, executable: str) -> boo
     return (install_dir / "bin" / executable).exists()
 
 
-def download_and_install_zip(url: str, install_dir: Path, executable: str) -> bool:
+def download_and_install_zip(
+    url: str,
+    install_dir: Path,
+    executable: str,
+    *,
+    digest: str | None = None,
+) -> bool:
     with tempfile.TemporaryDirectory() as temp_dir:
         archive = Path(temp_dir) / Path(urllib.parse.urlparse(url).path).name
         if not download_file(url, archive):
+            return False
+        if not verify_file_digest(archive, digest):
             return False
         return install_zip_to_dir(archive, install_dir, executable)
 
 
 def latest_winlibs_url() -> str | None:
+    releases = winlibs_releases(limit=1)
+    if releases and releases[0].url:
+        return releases[0].url
     html = fetch_text("https://winlibs.com/")
     if not html:
         return None
@@ -570,9 +1015,30 @@ def is_msvc_abi_clang(executable: Path) -> bool:
     return "clang" in text and "windows-msvc" in text
 
 
+def managed_toolchain_bin_dirs(root: Path) -> list[Path]:
+    bins: list[Path] = []
+    if (root / "bin").is_dir():
+        bins.append(root / "bin")
+    if not root.is_dir():
+        return bins
+    try:
+        version_dirs = [child for child in root.iterdir() if child.is_dir() and semantic_version_key(child.name)]
+    except OSError:
+        return bins
+    version_dirs.sort(key=lambda child: semantic_version_key(child.name), reverse=True)
+    bins[:0] = [child / "bin" for child in version_dirs if (child / "bin").is_dir()]
+    return bins
+
+
 def find_gcc_pair() -> tuple[str, str] | None:
     exe_suffix = ".exe" if is_windows() else ""
     candidates: list[tuple[Path, Path]] = []
+
+    preferred = PREFERRED_TOOLCHAIN_BINS.get("gcc")
+    if preferred:
+        candidates.append((preferred / f"gcc{exe_suffix}", preferred / f"g++{exe_suffix}"))
+    for bin_dir in managed_toolchain_bin_dirs(GCC_DIR):
+        candidates.append((bin_dir / f"gcc{exe_suffix}", bin_dir / f"g++{exe_suffix}"))
 
     path_gcc = find_from_path(f"gcc{exe_suffix}")
     path_gxx = find_from_path(f"g++{exe_suffix}")
@@ -607,13 +1073,19 @@ def find_clang_pair() -> tuple[str, str] | None:
     exe_suffix = ".exe" if is_windows() else ""
     candidates: list[tuple[Path, Path]] = []
 
+    preferred = PREFERRED_TOOLCHAIN_BINS.get("llvm-mingw")
+    if preferred:
+        candidates.append((preferred / f"clang{exe_suffix}", preferred / f"clang++{exe_suffix}"))
+    for bin_dir in managed_toolchain_bin_dirs(CLANG_DIR):
+        candidates.append((bin_dir / f"clang{exe_suffix}", bin_dir / f"clang++{exe_suffix}"))
+
+    for bin_dir in homebrew_formula_bin_dirs("llvm"):
+        candidates.append((bin_dir / "clang", bin_dir / "clang++"))
+
     path_clang = find_from_path(f"clang{exe_suffix}")
     path_clangxx = find_from_path(f"clang++{exe_suffix}")
     if path_clang and path_clangxx:
         candidates.append((path_clang, path_clangxx))
-
-    for bin_dir in homebrew_formula_bin_dirs("llvm"):
-        candidates.append((bin_dir / "clang", bin_dir / "clang++"))
 
     for clangxx in find_in_roots({f"clang++{exe_suffix}"}):
         clang = clangxx.with_name(f"clang{exe_suffix}")
@@ -629,6 +1101,16 @@ def find_clang_pair() -> tuple[str, str] | None:
 
 def find_clang_cl() -> str | None:
     exe_suffix = ".exe" if is_windows() else ""
+    preferred = PREFERRED_TOOLCHAIN_BINS.get("llvm-msvc")
+    if preferred:
+        candidate = preferred / f"clang-cl{exe_suffix}"
+        if candidate.exists() and (not is_windows() or is_msvc_abi_clang(candidate)):
+            return str(candidate)
+    for bin_dir in managed_toolchain_bin_dirs(CLANG_MSVC_DIR):
+        candidate = bin_dir / f"clang-cl{exe_suffix}"
+        if candidate.exists() and (not is_windows() or is_msvc_abi_clang(candidate)):
+            return str(candidate)
+
     path_clang_cl = find_from_path(f"clang-cl{exe_suffix}")
     if path_clang_cl and (not is_windows() or is_msvc_abi_clang(path_clang_cl)):
         return str(path_clang_cl)
@@ -840,6 +1322,199 @@ def discovered_compilers() -> dict[str, str | tuple[str, str]]:
     if msvc_cl and msvc_env:
         compilers["msvc"] = msvc_cl
     return compilers
+
+
+def compiler_full_version(executable: str, compiler: str) -> str | None:
+    commands = [[executable, "--version"]]
+    if compiler == "gcc":
+        commands.insert(0, [executable, "-dumpfullversion", "-dumpversion"])
+    for command in commands:
+        try:
+            result = capture_command(command)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        text = f"{result.stdout}\n{result.stderr}".strip()
+        match = re.search(r"(?<!\d)(\d+(?:\.\d+)+)(?!\d)", text)
+        if result.returncode == 0 and match:
+            return match.group(1)
+    return None
+
+
+def msvc_installation_version() -> str | None:
+    if not is_windows():
+        return None
+    program_files_x86 = Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)"))
+    vswhere = program_files_x86 / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if vswhere.exists():
+        try:
+            result = capture_command(
+                [
+                    str(vswhere),
+                    "-latest",
+                    "-products",
+                    "*",
+                    "-requires",
+                    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                    "-property",
+                    "installationVersion",
+                ]
+            )
+        except (OSError, subprocess.SubprocessError):
+            result = None
+        if result and result.returncode == 0:
+            match = re.search(r"\d+(?:\.\d+)+", result.stdout)
+            if match:
+                return match.group(0)
+    cl = find_msvc_cl()
+    return compiler_full_version(cl, "msvc") if cl else None
+
+
+def installed_toolchain_version(toolchain: str, llvm_variant: str = "auto") -> str | None:
+    if toolchain == "gcc":
+        pair = find_gcc_pair()
+        return compiler_full_version(pair[1], "gcc") if pair else None
+    if toolchain == "llvm":
+        if llvm_variant == "msvc":
+            clang_cl = find_clang_cl()
+            return compiler_full_version(clang_cl, "clang") if clang_cl else None
+        pair = find_clang_pair()
+        return compiler_full_version(pair[1], "clang") if pair else None
+    if toolchain == "msvc":
+        return msvc_installation_version() if has_msvc_build_environment() else None
+    raise ValueError(f"未知工具链：{toolchain}")
+
+
+def prompt_toolchain_install_requests(
+    selection: ToolchainSelection,
+    *,
+    system: str | None = None,
+    input_fn=input,
+) -> tuple[ToolchainInstallRequest, ...]:
+    host = normalized_system(system)
+    required = set(required_install_toolchains(selection, system))
+    requests: list[ToolchainInstallRequest] = []
+    print("\n[选择] 编译器安装与升级")
+    print("  可逐项跳过；已有编译器不会在未确认时升级。")
+
+    for toolchain in supported_install_toolchains(system):
+        llvm_variant = "auto"
+        choose_llvm_variant = toolchain == "llvm" and host == "windows" and selection.compiler != "clang"
+        if toolchain == "llvm" and host == "windows" and not choose_llvm_variant:
+            llvm_variant = llvm_variant_for_selection(selection, system)
+
+        if choose_llvm_variant:
+            variant_versions = {variant: installed_toolchain_version("llvm", variant) for variant in ("mingw", "msvc")}
+            installed = next((version for version in variant_versions.values() if version), None)
+        else:
+            installed = installed_toolchain_version(toolchain, llvm_variant)
+        label = TOOLCHAIN_LABELS[toolchain]
+        if installed:
+            if choose_llvm_variant:
+                summary = "，".join(
+                    f"{LLVM_VARIANT_LABELS[variant]} {version}"
+                    for variant, version in variant_versions.items()
+                    if version
+                )
+                log(f"{label} 已安装：{summary}")
+                question = f"{label} 已安装 {summary}，是否选择模式和版本进行升级/切换"
+            else:
+                log(f"{label} 已安装版本：{installed}")
+                question = f"{label} 当前版本 {installed}，是否选择版本并升级/切换"
+            default = False
+        else:
+            log(f"{label} 当前未安装。")
+            question = f"未检测到 {label}，是否安装"
+            default = toolchain in required
+        if not prompt_yes_no(question, default=default, input_fn=input_fn):
+            continue
+
+        if choose_llvm_variant:
+            llvm_variant = prompt_choice(
+                "LLVM Windows 运行模式",
+                ("mingw", "msvc"),
+                LLVM_VARIANT_LABELS,
+                "mingw",
+                input_fn,
+            )
+            installed = variant_versions[llvm_variant]
+
+        releases = available_toolchain_releases(
+            toolchain,
+            llvm_variant=llvm_variant,
+            system=system,
+        )
+        if releases:
+            versions = tuple(dict.fromkeys(release.version for release in releases))
+            release_by_version = {release.version: release for release in releases}
+            labels = {version: release_by_version[version].label for version in versions}
+            version = (
+                prompt_choice(f"{label} 版本", versions, labels, versions[0], input_fn)
+                if len(versions) > 1
+                else versions[0]
+            )
+        else:
+            warn(f"未能列出 {label} 的可用版本，将在安装时再次查询最新版本。")
+            version = "latest"
+
+        requests.append(
+            ToolchainInstallRequest(
+                toolchain=toolchain,
+                version=version,
+                upgrade=installed is not None,
+                llvm_variant=llvm_variant,
+            )
+        )
+    return tuple(requests)
+
+
+def parse_toolchain_versions(values: list[str] | tuple[str, ...] | None) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for value in values or ():
+        toolchain, separator, version = value.partition("=")
+        toolchain = toolchain.strip().lower()
+        version = version.strip()
+        if separator != "=" or toolchain not in TOOLCHAIN_LABELS or not version:
+            raise ValueError("--toolchain-version 必须使用 NAME=VERSION，例如 gcc=16.2.0")
+        parsed[toolchain] = version
+    return parsed
+
+
+def noninteractive_toolchain_install_requests(
+    selection: ToolchainSelection,
+    toolchains: tuple[str, ...] | list[str],
+    versions: dict[str, str] | None = None,
+    *,
+    upgrade: bool = False,
+    llvm_variant: str = "auto",
+    system: str | None = None,
+) -> tuple[ToolchainInstallRequest, ...]:
+    requested = list(dict.fromkeys(toolchains))
+    if upgrade and not requested:
+        requested = list(required_install_toolchains(selection, system))
+    supported = supported_install_toolchains(system)
+    invalid = [toolchain for toolchain in requested if toolchain not in supported]
+    if invalid:
+        raise ValueError(f"当前系统不支持安装：{', '.join(invalid)}；可选值：{', '.join(supported)}")
+
+    version_map = versions or {}
+    unused = [toolchain for toolchain in version_map if toolchain not in requested]
+    if unused:
+        raise ValueError(f"以下工具链指定了版本但未通过 --install-toolchain 选择：{', '.join(unused)}")
+
+    requests: list[ToolchainInstallRequest] = []
+    for toolchain in requested:
+        variant = llvm_variant
+        if toolchain == "llvm" and variant == "auto":
+            variant = llvm_variant_for_selection(selection, system)
+        requests.append(
+            ToolchainInstallRequest(
+                toolchain=toolchain,
+                version=version_map.get(toolchain, "latest"),
+                upgrade=upgrade,
+                llvm_variant=variant,
+            )
+        )
+    return tuple(requests)
 
 
 def preset_group_for_selection(selection: ToolchainSelection) -> str:
@@ -1074,7 +1749,7 @@ def elevated_command(command: list[str]) -> list[str]:
     return ["sudo", *command]
 
 
-def install_system_packages(packages: tuple[str, ...]) -> bool:
+def install_system_packages(packages: tuple[str, ...], *, upgrade: bool = False) -> bool:
     manager = detect_package_manager()
     if not manager:
         warn("未识别可用的系统包管理器。")
@@ -1082,7 +1757,12 @@ def install_system_packages(packages: tuple[str, ...]) -> bool:
 
     unique_packages = tuple(dict.fromkeys(packages))
     if manager == "brew":
-        return run_command([shutil.which("brew") or "brew", "install", *unique_packages]).returncode == 0
+        brew = shutil.which("brew") or "brew"
+        if upgrade:
+            result = run_command([brew, "upgrade", *unique_packages])
+            if result.returncode == 0:
+                return True
+        return run_command([brew, "install", *unique_packages]).returncode == 0
     if manager == "apt-get":
         update = run_command(elevated_command([manager, "update"]))
         if update.returncode != 0:
@@ -1170,141 +1850,245 @@ def planned_system_packages(
     return tuple(dict.fromkeys(packages))
 
 
-def install_gcc(check_only: bool) -> bool:
-    if find_gcc_pair():
-        ok("已检测到 GCC/G++。")
+def requested_release(toolchain: str, version: str, llvm_variant: str = "auto") -> ToolchainRelease | None:
+    releases = available_toolchain_releases(toolchain, llvm_variant=llvm_variant)
+    release = select_toolchain_release(releases, version)
+    if not release:
+        warn(f"未找到 {TOOLCHAIN_LABELS[toolchain]} 版本 {version}。")
+    return release
+
+
+def install_gcc(check_only: bool, *, version: str | None = None, upgrade: bool = False) -> bool:
+    installed = installed_toolchain_version("gcc")
+    if installed and not upgrade:
+        ok(f"已检测到 GCC/G++ {installed}。")
         return True
 
-    notes = compiler_install_notes()
-    warn(f"未检测到 GCC/G++。{notes['gcc']}")
     if check_only:
-        return False
+        warn("未检测到 GCC/G++。" if not installed else f"GCC/G++ 当前版本：{installed}；未执行升级检查。")
+        return installed is not None
 
     if is_windows():
-        url = latest_winlibs_url()
-        if not url:
-            warn(f"未能从 winlibs.com 自动解析 GCC 下载链接。请手动下载 WinLibs 并解压到：{GCC_DIR}")
+        requested_version = version or "latest"
+        release = requested_release("gcc", requested_version)
+        if not release or not release.url:
+            warn(f"无法解析所选 WinLibs GCC 版本；请检查网络或手动安装到：{GCC_DIR}")
             return False
-        if download_and_install_zip(url, GCC_DIR, "g++.exe") and find_gcc_pair():
-            ok("GCC/G++ 已通过 WinLibs 安装。")
+        if installed == release.version:
+            ok(f"GCC/G++ 已是所选版本 {release.version}。")
             return True
-        warn(f"GCC/G++ 自动安装失败。请手动下载 WinLibs 并解压到：{GCC_DIR}")
+        if installed and requested_version == "latest" and version_is_at_least(installed, release.version):
+            ok(f"GCC/G++ 当前版本 {installed} 不低于最新可用版本 {release.version}。")
+            return True
+        install_dir = GCC_DIR / release.version
+        bin_dir = install_dir / "bin"
+        if (bin_dir / "g++.exe").exists():
+            PREFERRED_TOOLCHAIN_BINS["gcc"] = bin_dir
+            add_to_process_path(bin_dir)
+            ok(f"已切换到现有 GCC/G++ {release.version}：{install_dir}")
+            return True
+        if download_and_install_zip(
+            release.url,
+            install_dir,
+            "g++.exe",
+            digest=release.digest,
+        ):
+            PREFERRED_TOOLCHAIN_BINS["gcc"] = bin_dir
+            add_to_process_path(bin_dir)
+            ok(f"GCC/G++ {release.version} 已通过 WinLibs 安装到：{install_dir}")
+            return True
+        warn(f"GCC/G++ {release.version} 自动安装失败。")
         return False
 
     manager = detect_package_manager()
+    if version not in {None, "latest"}:
+        warn(f"{manager or '当前系统'} 暂不支持按上游版本号安装 GCC {version}；请使用 latest。")
+        return False
     packages = packages_for("gcc", manager) if manager else ()
     if not packages:
         warn("未识别可自动安装 GCC 的包管理器。")
         return False
-    return install_system_packages(packages) and bool(find_gcc_pair())
+    return install_system_packages(packages, upgrade=upgrade) and bool(find_gcc_pair())
 
 
-def install_clang(check_only: bool) -> bool:
-    if find_clang_pair():
-        ok("已检测到 Clang/Clang++。")
+def install_clang(check_only: bool, *, version: str | None = None, upgrade: bool = False) -> bool:
+    installed = installed_toolchain_version("llvm", "mingw" if is_windows() else "auto")
+    if installed and not upgrade:
+        ok(f"已检测到 Clang/Clang++ {installed}。")
         return True
 
-    notes = compiler_install_notes()
-    warn(f"未检测到 Clang。{notes['clang']}")
     if check_only:
-        return False
+        warn("未检测到 Clang/Clang++。" if not installed else f"Clang/Clang++ 当前版本：{installed}；未执行升级检查。")
+        return installed is not None
 
     if is_windows():
-        url = latest_llvm_mingw_url()
-        if not url:
-            warn(
-                f"未能从 mstorsjo/llvm-mingw 自动解析 Clang 下载链接。请手动下载 ucrt-x86_64 zip 并解压到：{CLANG_DIR}"
-            )
+        requested_version = version or "latest"
+        release = requested_release("llvm", requested_version, "mingw")
+        if not release or not release.url:
+            warn(f"无法解析所选 llvm-mingw 版本；请检查网络或手动安装到：{CLANG_DIR}")
             return False
-        if download_and_install_zip(url, CLANG_DIR, "clang++.exe") and find_clang_pair():
-            ok("Clang/Clang++ 已通过 llvm-mingw 安装。")
+        if installed == release.version:
+            ok(f"Clang/Clang++ 已是所选版本 {release.version}。")
             return True
-        warn(f"Clang/Clang++ 自动安装失败。请手动下载 llvm-mingw 并解压到：{CLANG_DIR}")
-        return False
-
-    if normalized_system() == "darwin":
-        manager = detect_package_manager()
-        if manager == "brew":
-            return install_system_packages(packages_for("clang", manager)) and bool(find_clang_pair())
-        warn("未检测到 Xcode Command Line Tools 或 Homebrew；请运行 xcode-select --install 后重试。")
+        if installed and requested_version == "latest" and version_is_at_least(installed, release.version):
+            ok(f"Clang/Clang++ 当前版本 {installed} 不低于最新可用版本 {release.version}。")
+            return True
+        install_dir = CLANG_DIR / release.version
+        bin_dir = install_dir / "bin"
+        if (bin_dir / "clang++.exe").exists():
+            PREFERRED_TOOLCHAIN_BINS["llvm-mingw"] = bin_dir
+            add_to_process_path(bin_dir)
+            ok(f"已切换到现有 LLVM/MinGW {release.version}：{install_dir}")
+            return True
+        if download_and_install_zip(
+            release.url,
+            install_dir,
+            "clang++.exe",
+            digest=release.digest,
+        ):
+            PREFERRED_TOOLCHAIN_BINS["llvm-mingw"] = bin_dir
+            add_to_process_path(bin_dir)
+            ok(f"Clang/Clang++ {release.version} 已通过 llvm-mingw 安装到：{install_dir}")
+            return True
+        warn(f"Clang/Clang++ {release.version} 自动安装失败。")
         return False
 
     manager = detect_package_manager()
+    if version not in {None, "latest"}:
+        warn(f"{manager or '当前系统'} 暂不支持按上游版本号安装 LLVM {version}；请使用 latest。")
+        return False
+    if normalized_system() == "darwin" and manager != "brew":
+        warn("未检测到 Homebrew；请先安装 Homebrew，或使用 xcode-select --install 安装系统 Clang。")
+        return False
     packages = packages_for("clang", manager) if manager else ()
     if not packages:
         warn("未识别可自动安装 Clang 的包管理器。")
         return False
-    return install_system_packages(packages) and bool(find_clang_pair())
+    return install_system_packages(packages, upgrade=upgrade) and bool(find_clang_pair())
 
 
-def install_clang_msvc(check_only: bool) -> bool:
+def install_clang_msvc(check_only: bool, *, version: str | None = None, upgrade: bool = False) -> bool:
     if not is_windows():
         return True
-    if find_clang_cl():
-        ok("已检测到 clang-cl。")
+    installed = installed_toolchain_version("llvm", "msvc")
+    if installed and not upgrade:
+        ok(f"已检测到 clang-cl {installed}。")
+        return True
+    if check_only:
+        warn("未检测到 clang-cl。" if not installed else f"clang-cl 当前版本：{installed}；未执行升级检查。")
+        return installed is not None
+
+    requested_version = version or "latest"
+    release = requested_release("llvm", requested_version, "msvc")
+    if not release or not release.url:
+        warn(f"无法解析所选 LLVM Windows 安装器；请检查网络或手动安装到：{CLANG_MSVC_DIR}")
+        return False
+    if installed == release.version:
+        ok(f"clang-cl 已是所选版本 {release.version}。")
+        return True
+    if installed and requested_version == "latest" and version_is_at_least(installed, release.version):
+        ok(f"clang-cl 当前版本 {installed} 不低于最新可用版本 {release.version}。")
         return True
 
-    notes = compiler_install_notes()
-    warn(f"未检测到 clang-cl。{notes['clang_msvc']}")
-    if check_only:
-        return False
-
-    url = latest_llvm_msvc_url()
-    if not url:
-        warn(f"未能从 llvm/llvm-project release 自动解析 LLVM Windows 安装器。请手动安装到：{CLANG_MSVC_DIR}")
-        return False
+    install_dir = CLANG_MSVC_DIR / release.version
+    bin_dir = install_dir / "bin"
+    if (bin_dir / "clang-cl.exe").exists():
+        PREFERRED_TOOLCHAIN_BINS["llvm-msvc"] = bin_dir
+        add_to_process_path(bin_dir)
+        ok(f"已切换到现有 clang-cl {release.version}：{install_dir}")
+        return True
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        installer = Path(temp_dir) / Path(urllib.parse.urlparse(url).path).name
-        if not download_file(url, installer):
+        installer = Path(temp_dir) / Path(urllib.parse.urlparse(release.url).path).name
+        if not download_file(release.url, installer) or not verify_file_digest(installer, release.digest):
             return False
-        CLANG_MSVC_DIR.parent.mkdir(parents=True, exist_ok=True)
-        result = run_command([str(installer), "/S", f"/D={CLANG_MSVC_DIR}"])
-        if result.returncode == 0 and find_clang_cl():
-            ok(f"clang-cl 已通过 llvm/llvm-project release 安装到：{CLANG_MSVC_DIR}")
+        install_dir.parent.mkdir(parents=True, exist_ok=True)
+        result = run_command([str(installer), "/S", f"/D={install_dir}"])
+        if result.returncode == 0 and (bin_dir / "clang-cl.exe").exists():
+            PREFERRED_TOOLCHAIN_BINS["llvm-msvc"] = bin_dir
+            add_to_process_path(bin_dir)
+            ok(f"clang-cl {release.version} 已安装到：{install_dir}")
             return True
 
-    warn(f"clang-cl 自动安装失败。请从 llvm/llvm-project releases 下载 Windows installer，并安装到：{CLANG_MSVC_DIR}")
+    warn(f"clang-cl {release.version} 自动安装失败。")
     return False
 
 
-def install_msvc(check_only: bool) -> bool:
+def install_msvc(check_only: bool, *, version: str | None = None, upgrade: bool = False) -> bool:
     if not is_windows():
         warn("MSVC 仅支持 Windows。")
         return False
-    if has_msvc_build_environment():
-        ok("已检测到 MSVC 编译器、link.exe 和 Windows SDK。")
+    installed = installed_toolchain_version("msvc")
+    if installed and not upgrade:
+        ok(f"已检测到完整 MSVC 构建环境 {installed}。")
+        return True
+    if check_only:
+        warn("未检测到完整 MSVC 构建环境。" if not installed else f"MSVC 当前版本：{installed}；未执行升级检查。")
+        return installed is not None
+
+    requested_version = version or "latest"
+    release = requested_release("msvc", requested_version)
+    if not release:
+        return False
+    target_version = release.version if release else version or "latest"
+    if installed and target_version == installed:
+        ok(f"MSVC 已是所选版本 {installed}。")
+        return True
+    if installed and requested_version == "latest" and version_is_at_least(installed, target_version):
+        ok(f"MSVC 当前版本 {installed} 不低于最新可用版本 {target_version}。")
         return True
 
-    warn(f"未检测到完整 MSVC 构建环境。{compiler_install_notes()['msvc']}")
-    if check_only:
-        return False
-
     winget = shutil.which("winget")
-    if not winget:
-        warn("未检测到 winget，无法自动安装 Visual Studio Build Tools。")
-        return False
-    result = run_command(
-        [
+    if winget and release.package_id:
+        same_major = bool(installed and semantic_version_key(installed) and semantic_version_key(target_version)) and (
+            semantic_version_key(installed)[0] == semantic_version_key(target_version)[0]
+        )
+        command = [
             winget,
-            "install",
+            "upgrade" if installed and same_major else "install",
             "--id",
-            "Microsoft.VisualStudio.BuildTools",
+            release.package_id,
             "-e",
             "--source",
             "winget",
             "--accept-source-agreements",
             "--accept-package-agreements",
+            "--version",
+            release.version,
             "--override",
             "--passive --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended",
         ]
-    )
-    if result.returncode == 0 and has_msvc_build_environment():
-        ok("MSVC、link.exe 和 Windows SDK 已安装。")
+        result = run_command(command)
+    elif release.url:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            installer = Path(temp_dir) / "vs_buildtools.exe"
+            if not download_file(release.url, installer):
+                return False
+            verified = (
+                verify_file_digest(installer, release.digest)
+                if release.digest
+                else verify_microsoft_authenticode(installer)
+            )
+            if not verified:
+                return False
+            result = run_command(
+                [
+                    str(installer),
+                    "--passive",
+                    "--wait",
+                    "--norestart",
+                    "--add",
+                    "Microsoft.VisualStudio.Workload.VCTools",
+                    "--includeRecommended",
+                ]
+            )
+    else:
+        warn("未检测到 winget，且所选 MSVC 版本没有可用的 Microsoft bootstrapper。")
+        return False
+    if result.returncode in {0, 3010} and has_msvc_build_environment():
+        ok(f"MSVC、link.exe 和 Windows SDK 已安装/升级到所选版本 {target_version}。")
         return True
-    warn(
-        "Visual Studio Build Tools 安装后仍未发现完整 C++ workload；请在 Visual Studio Installer 中添加 C++ Build Tools。"
-    )
+    warn("Visual Studio Build Tools 操作后仍未发现完整 C++ workload；请在 Visual Studio Installer 中检查安装。")
     return False
 
 
@@ -1479,6 +2263,29 @@ def install_linker(selection: ToolchainSelection, check_only: bool) -> bool:
     return False
 
 
+def install_toolchain_request(request: ToolchainInstallRequest, check_only: bool) -> bool:
+    label = TOOLCHAIN_LABELS[request.toolchain]
+    action = "升级/切换" if request.upgrade else "安装"
+    log(f"准备{action} {label}，目标版本：{request.version}")
+    if request.toolchain == "gcc":
+        return install_gcc(check_only, version=request.version, upgrade=request.upgrade)
+    if request.toolchain == "llvm":
+        if request.llvm_variant == "msvc":
+            return install_clang_msvc(check_only, version=request.version, upgrade=request.upgrade)
+        return install_clang(check_only, version=request.version, upgrade=request.upgrade)
+    if request.toolchain == "msvc":
+        return install_msvc(check_only, version=request.version, upgrade=request.upgrade)
+    raise ValueError(f"未知工具链：{request.toolchain}")
+
+
+def install_toolchain_requests(requests: tuple[ToolchainInstallRequest, ...], check_only: bool) -> bool:
+    all_ok = True
+    for request in requests:
+        if not install_toolchain_request(request, check_only):
+            all_ok = False
+    return all_ok
+
+
 def install_selected_compiler(selection: ToolchainSelection, check_only: bool) -> bool:
     mode = selection_compiler_mode(selection)
     if mode == "gcc":
@@ -1492,14 +2299,19 @@ def install_selected_compiler(selection: ToolchainSelection, check_only: bool) -
     return msvc_ok and clang_ok
 
 
-def prepare_selected_toolchain(selection: ToolchainSelection, check_only: bool) -> bool:
+def prepare_selected_toolchain(
+    selection: ToolchainSelection,
+    check_only: bool,
+    *,
+    allow_compiler_install: bool = True,
+) -> bool:
     if not check_only and not is_windows():
         manager = detect_package_manager()
         if manager:
             packages = planned_system_packages(
                 selection,
                 manager,
-                compiler_missing=selected_compiler_executables(selection) is None,
+                compiler_missing=allow_compiler_install and selected_compiler_executables(selection) is None,
                 stdlib_missing=not supports_standard_library(selection),
                 linker_missing=linker_path(selection.linker, selection) is None,
             )
@@ -1507,7 +2319,12 @@ def prepare_selected_toolchain(selection: ToolchainSelection, check_only: bool) 
                 log(f"按 {manager} 合并安装所选工具链软件包：{', '.join(packages)}")
                 install_system_packages(packages)
 
-    compiler_ok = install_selected_compiler(selection, check_only)
+    if allow_compiler_install:
+        compiler_ok = install_selected_compiler(selection, check_only)
+    else:
+        compiler_ok = selected_compiler_executables(selection) is not None
+        if not compiler_ok:
+            warn("所选主编译器未安装，且交互安装计划已选择跳过。")
     stdlib_ok = compiler_ok and install_standard_library(selection, check_only)
     linker_ok = compiler_ok and install_linker(selection, check_only)
     if compiler_ok and stdlib_ok and linker_ok:
@@ -1781,6 +2598,11 @@ def setup_environment(
     linker: str = "auto",
     interactive: bool = False,
     selection: ToolchainSelection | None = None,
+    install_toolchains: tuple[str, ...] = (),
+    toolchain_versions: dict[str, str] | None = None,
+    upgrade_toolchains: bool = False,
+    llvm_variant: str = "auto",
+    input_fn=input,
 ) -> bool:
     global LAST_AVAILABLE_PRESET_GROUPS, LAST_PRESET_ENVIRONMENTS, LAST_TOOLCHAIN_SELECTION
 
@@ -1788,13 +2610,31 @@ def setup_environment(
     log(f"Python：{sys.version.split()[0]}，路径：{sys.executable}")
 
     LAST_TOOLCHAIN_SELECTION = None
+    PREFERRED_TOOLCHAIN_BINS.clear()
     try:
         selection = selection or resolve_toolchain_selection(
             compiler=compiler,
             stdlib=stdlib,
             linker=linker,
             interactive=interactive,
+            input_fn=input_fn,
         )
+        explicit_cli_management = bool(install_toolchains or toolchain_versions or upgrade_toolchains)
+        if interactive and not check_only and not explicit_cli_management:
+            install_requests = prompt_toolchain_install_requests(selection, input_fn=input_fn)
+            explicit_management = True
+        elif explicit_cli_management:
+            install_requests = noninteractive_toolchain_install_requests(
+                selection,
+                install_toolchains,
+                toolchain_versions,
+                upgrade=upgrade_toolchains,
+                llvm_variant=llvm_variant,
+            )
+            explicit_management = True
+        else:
+            install_requests = ()
+            explicit_management = False
     except ValueError as exc:
         error(str(exc))
         return False
@@ -1828,7 +2668,14 @@ def setup_environment(
         if not ensure_tool(tool, uv, check_only) and tool.required:
             required_ok = False
 
-    if not prepare_selected_toolchain(selection, check_only):
+    if install_requests and not install_toolchain_requests(install_requests, check_only):
+        required_ok = False
+
+    if not prepare_selected_toolchain(
+        selection,
+        check_only,
+        allow_compiler_install=not explicit_management,
+    ):
         required_ok = False
 
     if not ensure_conan_profile(check_only):
@@ -1857,8 +2704,33 @@ def main(argv=None) -> int:
     parser.add_argument("--compiler", choices=("auto", "clang", "gcc", "msvc"), default="auto")
     parser.add_argument("--stdlib", choices=("auto", "libc++", "libstdc++", "msvc"), default="auto")
     parser.add_argument("--linker", choices=("auto", "system", "lld", "bfd", "mold", "msvc"), default="auto")
+    parser.add_argument(
+        "--install-toolchain",
+        action="append",
+        choices=("gcc", "llvm", "msvc"),
+        default=[],
+        help="显式安装/管理工具链，可重复指定。交互模式下不指定时会逐项询问。",
+    )
+    parser.add_argument(
+        "--toolchain-version",
+        action="append",
+        default=[],
+        metavar="NAME=VERSION",
+        help="指定工具链版本，例如 llvm=22.1.8；可重复指定。",
+    )
+    parser.add_argument("--upgrade-toolchains", action="store_true", help="允许升级所选的现有工具链。")
+    parser.add_argument(
+        "--llvm-variant",
+        choices=("auto", "mingw", "msvc"),
+        default="auto",
+        help="Windows LLVM 运行模式；auto 根据标准库选择。",
+    )
     parser.add_argument("--non-interactive", action="store_true", help="不显示选择菜单，对 auto 项使用系统默认值。")
     args = parser.parse_args(argv)
+    try:
+        toolchain_versions = parse_toolchain_versions(args.toolchain_version)
+    except ValueError as exc:
+        parser.error(str(exc))
     interactive = not args.non_interactive and sys.stdin.isatty()
     return (
         0
@@ -1868,6 +2740,10 @@ def main(argv=None) -> int:
             stdlib=args.stdlib,
             linker=args.linker,
             interactive=interactive,
+            install_toolchains=tuple(args.install_toolchain),
+            toolchain_versions=toolchain_versions,
+            upgrade_toolchains=args.upgrade_toolchains,
+            llvm_variant=args.llvm_variant,
         )
         else 1
     )
